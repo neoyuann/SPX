@@ -90,6 +90,11 @@ def cmd_discover(args):
 
 
 def cmd_run(args):
+    cfg_check = load_yaml(args.config)
+    if "you@example.com" in str(cfg_check.get("run", {}).get("user_agent", "")):
+        print("[warn] config.yaml's run.user_agent still has the placeholder email — "
+              "SEC EDGAR silently rejects requests without a real contact address, "
+              "so every US company's sec_edgar source will fail until you put yours in.")
     result = run_pipeline(args.config, args.companies, verbose=True,
                            only_ticker=args.ticker, no_news=args.no_news)
     cfg = load_yaml(args.config)

@@ -40,14 +40,19 @@ run:
   # cap themselves (most carry 20-50 recent items) so this mainly affects
   # EDGAR, which is the one source that genuinely reaches back years.
   max_items_per_source: 250
-  # Hard ceiling on a single refresh, wall-clock. Once hit, the run finishes
-  # cleanly with whatever it has — remaining companies are skipped and listed
-  # in the run's notes, picked up on the next refresh rather than left
-  # hanging. With a roster of ~2,900 companies nearly all sharing the same
-  # news.google.com host (rate-limited by host_delay_overrides above), a
-  # full pass takes roughly 20 minutes; 1800s gives that headroom to finish
-  # in one run rather than needing two. It's a background thread either
-  # way — the page stays responsive while this runs.
+  # Ceiling on the *fetching* phase, wall-clock — not the whole run.
+  # Classifying, grouping, link-checking and storing whatever was actually
+  # fetched always runs to completion regardless of this number; only
+  # fetching stops once it's hit, and whichever companies didn't get
+  # fetched are named in the run's notes and picked up next time. (An
+  # earlier version gated the whole run behind this, so a fetch phase that
+  # ran long on real-world network latency could silently discard
+  # everything it had already gathered — fixed; see pipeline.py's module
+  # docstring.) With a roster of ~2,900 companies nearly all sharing the
+  # same news.google.com host (rate-limited by host_delay_overrides above),
+  # a full fetch pass takes roughly 20 minutes; 1800s gives that headroom.
+  # It's a background thread either way — the page stays responsive
+  # regardless of how long this runs.
   max_run_seconds: 1800
   user_agent: "CorporateEventTracker/1.0 (research use; contact: you@example.com)"
   # ^ SEC EDGAR requires a real contact address in the User-Agent. Put yours in.

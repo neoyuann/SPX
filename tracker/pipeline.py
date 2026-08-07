@@ -5,9 +5,19 @@ every surviving link is actually live, and write the result to the store.
 Bounded on two axes, both enforced here rather than just documented:
   - per-request timeout (run.request_timeout) so one bad host can't stall
     everything behind it
-  - a whole-run wall-clock budget (run.max_run_seconds) so a refresh always
-    finishes; whatever didn't get to run is named in the run's notes and
-    picked up on the next refresh
+  - a wall-clock budget on *fetching* (run.max_run_seconds) so a refresh
+    doesn't spend unbounded time gathering raw data; whatever didn't get
+    fetched is named in the run's notes and picked up on the next refresh
+
+Classifying, grouping, link-checking and storing whatever *was* fetched is
+deliberately unconditional — not bounded by the same clock. An earlier
+version gated that whole phase behind "is there still time left in the
+budget", and on a roster large enough that fetching alone could eat the
+full budget (real-world network latency across thousands of sources, not
+just the sandbox estimate this was tuned against), every single
+successfully-fetched, successfully-classified item for that run was
+silently discarded — a refresh that ran for half an hour without erroring
+and stored nothing. Reproduced and fixed; see the regression test.
 """
 from __future__ import annotations
 
@@ -220,30 +230,34 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
 
     # Verify every surviving link is actually live before it can reach the
     # page. An event that loses its only link is dropped rather than shown
-    # pointing somewhere dead. Same bounded-concurrency approach as fetching.
+    # pointing somewhere dead. This always runs to completion over whatever
+    # was grouped, regardless of run.max_run_seconds — that budget bounds
+    # fetching (above), not this. Fetching already decided what got
+    # gathered within budget; having done that work, throwing it away here
+    # because the clock read past the budget during fetching would discard
+    # a run's entire output. (It used to, silently — see the module
+    # docstring.) Each check still has its own per-request timeout, so this
+    # can't hang, just take a while on a very large batch — and it's
+    # already a background thread, so that's a fine trade.
     def check_one(g):
         live = [s for s in g["sources"] if link_is_alive(session, s["url"], cfg)]
         return g, live
 
     kept = []
-    if time.time() - started <= max_run_seconds:
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
-            futures = [pool.submit(check_one, g) for g in grouped]
-            for future in as_completed(futures):
-                if time.time() - started > max_run_seconds:
-                    out_of_time = True
-                    continue
-                g, live_sources = future.result()
-                if not live_sources:
-                    continue
-                live_urls = {s["url"] for s in live_sources}
-                if g["event"]["primary_url"] not in live_urls:
-                    live_sources.sort(key=lambda s: tier_priority(s["tier"]))
-                    g["event"]["primary_url"] = live_sources[0]["url"]
-                g["sources"] = live_sources
-                kept.append(g)
-    else:
-        out_of_time = True
+    link_check_failed = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = [pool.submit(check_one, g) for g in grouped]
+        for future in as_completed(futures):
+            g, live_sources = future.result()
+            if not live_sources:
+                link_check_failed += 1
+                continue
+            live_urls = {s["url"] for s in live_sources}
+            if g["event"]["primary_url"] not in live_urls:
+                live_sources.sort(key=lambda s: tier_priority(s["tier"]))
+                g["event"]["primary_url"] = live_sources[0]["url"]
+            g["sources"] = live_sources
+            kept.append(g)
 
     new_count = 0
     changed_count = 0
@@ -254,9 +268,14 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
         elif status in ("date_moved", "updated"):
             changed_count += 1
 
-    notes = ""
+    # Always recorded, not just when something's wrong — this is what makes
+    # "why did a run store nothing" answerable from the History panel
+    # instead of needing a terminal.
+    stats = (f"{len(classified_items)} items classified, {len(grouped)} grouped into "
+             f"events, {link_check_failed} failed their link check, {len(kept)} kept")
+    notes = stats
     if out_of_time and skipped_companies:
-        notes = "ran out of time, skipped: " + ", ".join(sorted(set(skipped_companies)))
+        notes += "; ran out of time, skipped: " + ", ".join(sorted(set(skipped_companies)))
     store.finish_run(run_id, ok=True, companies=len(companies), sources=total,
                       new_count=new_count, changed_count=changed_count, notes=notes)
     store.close()

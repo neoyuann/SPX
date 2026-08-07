@@ -348,6 +348,10 @@ def serve(config_path="config.yaml", companies_path="companies.yaml",
     print("Loading companies.yaml...")
     n_companies = len(manager.roster().get("companies", []))
     print(f"Tracking {n_companies} companies.")
+    if "you@example.com" in str(cfg.get("run", {}).get("user_agent", "")):
+        print("[warn] config.yaml's run.user_agent still has the placeholder email — "
+              "SEC EDGAR silently rejects requests without a real contact address, "
+              "so every US company's sec_edgar source will fail until you put yours in.")
 
     # A host like Render assigns the port at run time and tells the app via
     # $PORT. It also routes traffic from outside the container, so binding to
