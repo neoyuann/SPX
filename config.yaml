@@ -1,0 +1,250 @@
+# =============================================================================
+# SETTINGS  --  edit this to tune what counts as an event and where news may
+# come from. You will edit companies.yaml far more often than this file.
+# =============================================================================
+
+run:
+  # Keep every event from this date onward. 2026-01-01 gives you the full year
+  # to date; move it back to 2025-01-01 if you want more history.
+  # Keep every event from this date onward.
+  #
+  # How far back you actually get depends on the source, not just this setting:
+  #   sec_edgar  reaches back years — the workhorse for backfilling history
+  #   rss        only what the feed currently carries, typically 20-50 items
+  #   ir_page    only what's on the page you pointed it at
+  #   news       last 30 days only (it's corroboration, not an archive)
+  # So for real 2026 history, give US-listed companies a `sec_edgar` source
+  # with their CIK. Companies that don't file with the SEC (most HK, JP and TW
+  # names) will only fill in from the day you start running this daily.
+  history_from: "2026-01-01"
+  lookahead_days: 400         # keep scheduled events this far into the future
+  # (connect, read) seconds. A slow or silently-dropping host fails fast on
+  # the connect leg rather than eating its full timeout twice.
+  request_timeout: [6, 15]
+  polite_delay_seconds: 1.0   # pause between requests to the same host
+  # Raised so a full year of SEC filings can come back in one pull. RSS feeds
+  # cap themselves (most carry 20-50 recent items) so this mainly affects
+  # EDGAR, which is the one source that genuinely reaches back years.
+  max_items_per_source: 250
+  # Hard ceiling on a single refresh, wall-clock. Once hit, the run finishes
+  # cleanly with whatever it has — remaining companies are skipped and listed
+  # in the run's notes, not left hanging. Raise this if you track many
+  # companies and regularly see "skipped: ran out of time".
+  max_run_seconds: 240
+  user_agent: "CorporateEventTracker/1.0 (research use; contact: you@example.com)"
+  # ^ SEC EDGAR requires a real contact address in the User-Agent. Put yours in.
+
+output:
+  html_path: "out/dashboard.html"
+  db_path: "data/events.db"
+  # An event counts as "recently changed" if it moved within this many days.
+  change_window_days: 14
+
+# -----------------------------------------------------------------------------
+# REFRESH
+# `python -m tracker serve` runs a local server that rebuilds the page from the
+# database on every visit and re-scrapes sources in the background.
+# -----------------------------------------------------------------------------
+refresh:
+  port: 8765
+  on_visit: true
+  # Re-scrape on a visit only if the data is older than this. Not zero on
+  # purpose: a full run takes minutes and touches every IR site, so opening
+  # five tabs shouldn't fire five scrapes. "Refresh now" forces one regardless.
+  min_interval_minutes: 30
+  # Scheduled daily run, 24-hour local time. Set to null to turn it off.
+  daily_at: "07:00"
+
+# -----------------------------------------------------------------------------
+# NEWS WHITELIST
+# Nothing outside this list is ever written to the dashboard. Add or remove
+# domains freely. Company-owned domains are added automatically from
+# companies.yaml, so you don't need to list them here.
+# -----------------------------------------------------------------------------
+news:
+  enabled: true
+  allowed_domains:
+    # wire services and primary financial press
+    - reuters.com
+    - bloomberg.com
+    - ft.com
+    - wsj.com
+    - nikkei.com
+    - asia.nikkei.com
+    - businesstimes.com.sg
+    - straitstimes.com
+    - scmp.com
+    - cnbc.com
+    - barrons.com
+    # official press-release distributors (company copy, verbatim)
+    - businesswire.com
+    - globenewswire.com
+    - prnewswire.com
+    - newsroom.accenture.com
+    # exchange and regulator sites
+    - sec.gov
+    - hkexnews.hk
+    - www1.hkexnews.hk
+    - sgx.com
+    - release.tdnet.info
+    - mops.twse.com.tw
+
+# -----------------------------------------------------------------------------
+# EVENT TAXONOMY
+# Each category has weighted patterns (case-insensitive regex). An item is
+# scored against every category; the highest score wins. `min_score` is the
+# floor below which an item is discarded as not-an-event.
+#
+# To add a category: copy a block. To stop tracking one: set enabled: false.
+# -----------------------------------------------------------------------------
+classifier:
+  min_score: 2.0
+  categories:
+
+    earnings_call:
+      label: "Earnings Call"
+      enabled: true
+      patterns:
+        - ['\bearnings\s+(call|conference\s+call|webcast)\b', 4.0]
+        - ['\b(q[1-4]|first|second|third|fourth)[\s-]*quarter.*\bcall\b', 3.5]
+        - ['\bconference\s+call\b', 2.0]
+        - ['\bwebcast\b', 1.5]
+        - ['\bdial[- ]?in\b', 1.5]
+
+    earnings_release:
+      label: "Earnings Release"
+      enabled: true
+      patterns:
+        - ['\b(reports?|announces?|posts?)\b.{0,40}\b(q[1-4]|quarter|half[- ]year|full[- ]year|annual|interim)\b.{0,30}\b(results?|earnings)\b', 4.5]
+        - ['\b(q[1-4]|first|second|third|fourth)[\s-]*quarter\s+(20\d\d\s+)?(financial\s+)?results?\b', 4.0]
+        - ['\b(interim|annual|full[- ]year|half[- ]year)\s+(financial\s+)?(results?|report)\b', 3.5]
+        - ['\bfinancial\s+results?\b', 2.5]
+        - ['\b(interim|annual|quarterly)\s+(profit|earnings|revenue|loss)\b', 3.0]
+        - ['\b(beats?|misses?|tops?|falls?\s+short\s+of)\s+(estimates?|expectations?|consensus|forecasts?)\b', 3.0]
+        - ['\bprofit\s+(warning|alert)\b', 3.0]
+        # A full P&L write-up mentions margin/profit alongside revenue; a
+        # routine sales update almost never does. This disambiguates a
+        # quarterly earnings headline ("record quarterly revenue") from a
+        # monthly/quarterly top-line-only sales note, which otherwise score
+        # the same on the word "revenue" alone.
+        - ['\b(revenue|sales)\b.{0,120}\b(gross\s+margin|operating\s+(income|profit|margin)|net\s+income|diluted\s+(earnings|EPS))\b', 4.0]
+        - ['\b(gross\s+margin|operating\s+(income|profit)|net\s+income|diluted\s+(earnings|EPS))\b.{0,120}\b(revenue|sales)\b', 4.0]
+        - ['\b8-K\s+item\s+2\.02\b', 5.0]
+
+    guidance:
+      label: "Guidance"
+      enabled: true
+      patterns:
+        - ['\b(raises?|lowers?|cuts?|lifts?|updates?|reaffirms?|withdraws?)\b.{0,25}\b(guidance|outlook|forecast)\b', 4.5]
+        - ['\b(guidance|outlook)\s+(for|update|revision)\b', 3.0]
+        - ['\bfull[- ]year\s+(guidance|outlook)\b', 3.0]
+        - ['\brevised?\s+(forecast|outlook|guidance)\b', 3.5]
+        - ['\bguidance\b', 2.0]
+
+    investor_day:
+      label: "Investor Day"
+      enabled: true
+      patterns:
+        - ['\binvestor\s+(day|meeting)\b', 4.5]
+        - ['\bcapital\s+markets?\s+day\b', 5.0]
+        - ['\banalyst\s+(day|meeting|briefing)\b', 4.0]
+        - ['\bstrategy\s+(day|update|briefing)\b', 3.0]
+
+    capital_markets_day:
+      label: "Capital Markets Day"
+      enabled: true
+      patterns:
+        - ['\bcapital\s+markets?\s+day\b', 6.0]
+        - ['\bCMD\s+20\d\d\b', 3.0]
+
+    analyst_marketing:
+      label: "Analyst Marketing"
+      enabled: true
+      patterns:
+        - ['\bnon[- ]deal\s+roadshow\b', 4.5]
+        - ['\broadshow\b', 3.0]
+        - ['\banalyst\s+(marketing|outreach)\b', 4.0]
+        - ['\bmanagement\s+(meetings?|roadshow)\b', 2.5]
+
+    conference:
+      label: "Conference"
+      enabled: true
+      patterns:
+        - ['\b(to\s+)?(present|participate|speak)\b.{0,60}\bconference\b', 4.0]
+        - ['\b(global|annual|technology|investor|industry)\s+conference\b', 3.5]
+        - ['\b(summit|symposium|expo|trade\s+show|forum)\b', 2.5]
+        - ['\bconference\b', 1.5]
+        - ['\bkeynote\b', 2.0]
+
+    corporate_access:
+      label: "Corporate Access"
+      enabled: true
+      patterns:
+        - ['\bfireside\s+chat\b', 4.5]
+        - ['\bsite\s+(visit|tour)\b', 3.5]
+        - ['\b(plant|fab|factory)\s+(tour|visit|opening)\b', 3.5]
+        - ['\bcorporate\s+access\b', 4.0]
+        - ['\bone[- ]on[- ]one\s+meetings?\b', 3.0]
+
+    mergers_acquisitions:
+      label: "M&A"
+      enabled: true
+      patterns:
+        - ['\b(to\s+)?acquires?\b', 4.0]
+        - ['\bacquisition\s+of\b', 4.5]
+        - ['\b(merger|merges?\s+with)\b', 4.5]
+        - ['\b(definitive|share\s+purchase|business\s+combination)\s+agreement\b', 4.0]
+        - ['\b(divest|divestiture|disposal|carve[- ]out|spin[- ]off|sells?\s+stake)\b', 3.5]
+        - ['\b(tender|takeover)\s+offer\b', 4.0]
+        - ['\bjoint\s+venture\b', 3.0]
+        - ['\bcompletes?\s+(the\s+)?(acquisition|merger|sale)\b', 4.0]
+
+    shareholder_meeting:
+      label: "Shareholder Meeting"
+      enabled: true
+      patterns:
+        - ['\b(annual|extraordinary|special)\s+general\s+meeting\b', 5.0]
+        - ['\b(AGM|EGM|SGM)\b', 4.5]
+        - ['\bshareholders?\s+meeting\b', 4.5]
+        - ['\bproxy\s+statement\b', 3.5]
+        - ['\bnotice\s+of\s+meeting\b', 3.5]
+        - ['\bvoting\s+results?\b', 3.0]
+        - ['\b8-K\s+item\s+5\.07\b', 5.0]
+
+    sales_results:
+      label: "Sales Results"
+      enabled: true
+      patterns:
+        # "Monthly" is the distinctive signal for a routine top-line-only
+        # note. A bare "quarterly revenue" is deliberately weighted low here
+        # because it also appears in full earnings releases (see the
+        # disambiguating patterns added to earnings_release above) — without
+        # that gap, "record quarterly revenue" in an earnings headline
+        # outscores the earnings-release category on this word alone.
+        - ['\bmonthly\s+(revenue|sales)\b', 4.5]
+        - ['\bquarterly\s+(revenue|sales)\b', 1.5]
+        - ['\b(revenue|sales)\s+(for|report|update)\b.{0,25}\b(month|monthly)\b', 4.0]
+        - ['\b(shipment|delivery|unit)\s+(volumes?|numbers?|data)\b', 3.0]
+        - ['\b(booking|order\s+intake|backlog)\s+(update|report)\b', 3.0]
+        - ['\bsales\s+figures?\b', 3.0]
+
+    other_material:
+      label: "Other Material"
+      enabled: true
+      patterns:
+        - ['\b(dividend|buyback|share\s+repurchase|bond\s+issue|rights\s+issue)\b', 3.0]
+        - ['\b(CEO|CFO|chairman|board)\b.{0,30}\b(appoint|resign|steps?\s+down|succeed)\b', 3.5]
+        - ['\bcredit\s+rating\b', 2.5]
+        - ['\bcapacity\s+expansion\b', 2.5]
+
+# -----------------------------------------------------------------------------
+# SEC 8-K item codes -> category. These are exact, so they override keywords.
+# -----------------------------------------------------------------------------
+sec_item_map:
+  "1.01": mergers_acquisitions
+  "2.01": mergers_acquisitions
+  "2.02": earnings_release
+  "5.02": other_material
+  "5.07": shareholder_meeting
+  "7.01": investor_day
+  "8.01": other_material

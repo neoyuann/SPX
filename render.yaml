@@ -1,0 +1,23 @@
+# Render reads this file automatically and configures the service, so you
+# don't have to fill in build/start commands by hand.
+#
+# Free tier notes, so nothing surprises you:
+#   - The service sleeps after ~15 minutes with no visitors. The next visit
+#     wakes it, which takes 30-60 seconds. After that it's fast again.
+#   - The filesystem resets whenever the service restarts or redeploys. That
+#     means companies you add through the website are kept while it's awake,
+#     but revert to whatever is in this repo after a restart. To make a
+#     company permanent, add it here too (see SHARE THIS ONLINE.txt).
+
+services:
+  - type: web
+    name: corporate-event-monitor
+    runtime: python
+    plan: free
+    region: singapore
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m tracker serve
+    envVars:
+      - key: PYTHON_VERSION
+        value: "3.12.0"
+      # Render sets PORT itself; the app reads it and binds correctly.

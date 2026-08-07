@@ -1,0 +1,223 @@
+# =============================================================================
+# COMPANY LIST  --  this is the only file you need to edit to change coverage.
+# =============================================================================
+#
+# Add a company:      copy a block, change the fields, save. Nothing else.
+# Remove a company:   delete the block, or set `enabled: false` to keep history.
+# Re-run:             python -m tracker run
+#
+# Fields
+# ------
+#   ticker    short code used in the dashboard. Must be unique.
+#   name      full legal / display name. Used for news matching.
+#   exchange  free text, shown as a label.
+#   region    short code (US, DE, JP, HK, TW ...). Used for regulator feeds.
+#   country   country of listing. Drives the country groups on the page. If you
+#             leave it out it is derived from `region`.
+#   enabled   false = skip on this run but keep past events in the database.
+#   aliases   other names the press uses. Improves news matching. Optional.
+#   sources   where to look. Each entry has a `type` and a `tier`.
+#
+# Source types
+# ------------
+#   rss        an RSS/Atom feed. Best source: fast, clean, no scraping.
+#   ir_page    an HTML page scraped with CSS selectors (see `selectors`).
+#   sec_edgar  official SEC filings for US-listed issuers. Needs `cik`.
+#   news       whitelisted news wires only (domains set in config.yaml).
+#
+# Source tiers  (drives the confidence rail on each card)
+# ------------
+#   regulatory  filed with an exchange or regulator. Highest trust.
+#   company_ir  published by the company on its own IR site.
+#   newswire    company release carried by an official PR wire.
+#   news        third-party reporting from a whitelisted outlet.
+#
+# Prefer not to edit YAML? Open the page, press Companies, and add, pause or
+# remove companies there. It writes to this file and keeps these comments.
+#
+# Don't know a company's feed URL? Leave `sources` with just the IR homepage
+# and run:  python -m tracker discover --ticker XYZ
+# It will find feeds linked from that page and print blocks you can paste back.
+# Then run:  python -m tracker verify     to check every URL still responds.
+# =============================================================================
+
+companies:
+
+  - ticker: STM
+    name: STMicroelectronics N.V.
+    exchange: NYSE / Euronext Paris
+    region: EU
+    country: France
+    enabled: true
+    aliases: ["STMicro", "ST Micro"]
+    sources:
+      - type: rss
+        tier: company_ir
+        url: https://investors.st.com/rss/news-releases
+      - type: ir_page
+        tier: company_ir
+        url: https://investors.st.com/events-and-presentations
+        selectors:
+          item: "article, li.event, div.event-item"
+          title: "h3, h2, .title, a"
+          date: "time, .date, .event-date"
+          link: "a"
+      - type: sec_edgar
+        tier: regulatory
+        cik: "0000932787"
+      - type: news
+        tier: news
+
+  - ticker: IFX
+    name: Infineon Technologies AG
+    exchange: XETRA
+    region: EU
+    country: Germany
+    enabled: true
+    aliases: ["Infineon"]
+    sources:
+      - type: rss
+        tier: company_ir
+        url: https://www.infineon.com/cms/en/about-infineon/investor/rss/news.xml
+      - type: ir_page
+        tier: company_ir
+        url: https://www.infineon.com/cms/en/about-infineon/investor/financial-calendar/
+        selectors:
+          item: "tr, .calendar-entry"
+          title: "td:nth-child(2), .title"
+          date: "td:nth-child(1), time, .date"
+          link: "a"
+      - type: news
+        tier: news
+
+  - ticker: NXPI
+    name: NXP Semiconductors N.V.
+    exchange: NASDAQ
+    region: EU
+    country: United States
+    enabled: true
+    aliases: ["NXP"]
+    sources:
+      - type: rss
+        tier: company_ir
+        url: https://investors.nxp.com/rss/news-releases.xml
+      - type: sec_edgar
+        tier: regulatory
+        cik: "0001413447"
+      - type: news
+        tier: news
+
+  - ticker: ASML
+    name: ASML Holding N.V.
+    exchange: NASDAQ / Euronext Amsterdam
+    region: EU
+    country: Netherlands
+    enabled: true
+    aliases: ["ASML"]
+    sources:
+      - type: rss
+        tier: company_ir
+        url: https://www.asml.com/en/news/rss
+      - type: sec_edgar
+        tier: regulatory
+        cik: "0000937966"
+      - type: news
+        tier: news
+
+  - ticker: 6723.T
+    name: Renesas Electronics Corporation
+    exchange: TSE
+    region: JP
+    country: Japan
+    enabled: true
+    aliases: ["Renesas"]
+    sources:
+      - type: rss
+        tier: company_ir
+        url: https://www.renesas.com/en/rss/news.xml
+      - type: ir_page
+        tier: company_ir
+        url: https://www.renesas.com/en/about/investor-relations/ir-calendar
+        selectors:
+          item: "tr, .ir-calendar__item"
+          title: "td:nth-child(2), .title"
+          date: "td:nth-child(1), time"
+          link: "a"
+      - type: news
+        tier: news
+
+  - ticker: 1810.HK
+    name: Xiaomi Corporation
+    exchange: HKEX
+    region: HK
+    country: Hong Kong
+    enabled: true
+    aliases: ["Xiaomi"]
+    sources:
+      - type: ir_page
+        tier: company_ir
+        url: https://www.mi.com/global/about/investor
+        selectors:
+          item: "li, .news-item, tr"
+          title: "a, .title"
+          date: "time, .date, td:first-child"
+          link: "a"
+      - type: news
+        tier: news
+
+  - ticker: 0016.HK
+    name: Sun Hung Kai Properties Limited
+    exchange: HKEX
+    region: HK
+    country: Hong Kong
+    enabled: true
+    aliases: ["SHKP", "Sun Hung Kai"]
+    sources:
+      - type: ir_page
+        tier: company_ir
+        url: https://www.shkp.com/en-US/investor-relations/announcements
+        selectors:
+          item: "li, tr, .announcement-item"
+          title: "a, .title"
+          date: "time, .date, td:first-child"
+          link: "a"
+      - type: news
+        tier: news
+
+  - ticker: 1919.HK
+    name: COSCO SHIPPING Holdings Co., Ltd.
+    exchange: HKEX / SSE
+    region: HK
+    country: Hong Kong
+    enabled: true
+    aliases: ["COSCO SHIPPING Holdings", "COSCO Shipping"]
+    sources:
+      - type: ir_page
+        tier: company_ir
+        url: https://www.coscoshipping.com/en/Investors/Announcements/
+        selectors:
+          item: "li, tr, .list-item"
+          title: "a, .title"
+          date: "time, .date, span.date"
+          link: "a"
+      - type: news
+        tier: news
+
+  - ticker: 3037.TW
+    name: Unimicron Technology Corporation
+    exchange: TWSE
+    region: TW
+    country: Taiwan
+    enabled: true
+    aliases: ["Unimicron"]
+    sources:
+      - type: ir_page
+        tier: company_ir
+        url: https://www.unimicron.com/en/investors/news
+        selectors:
+          item: "li, tr, .news-item"
+          title: "a, .title"
+          date: "time, .date, td:first-child"
+          link: "a"
+      - type: news
+        tier: news
