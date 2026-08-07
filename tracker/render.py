@@ -36,15 +36,25 @@ def build_payload(cfg: dict, roster: dict) -> tuple[list, dict]:
     last_run = store.last_run()
     store.close()
 
+    # Country and sub-sector are company-level classification, not a fact
+    # about any one scrape — joined from the roster at render time so that
+    # relabelling a company (say, correcting its sub-sector) updates every
+    # one of its past events immediately, without needing a rescrape. A
+    # removed company's old events keep whatever was last stored.
+    roster_by_ticker = {c["ticker"]: c for c in roster.get("companies", [])}
+
     events = []
     for e in raw_events:
         if e.get("event_date") and e["event_date"] > cutoff:
             continue
+        company = roster_by_ticker.get(e["ticker"], {})
         events.append({
             "id": e["id"], "ticker": e["ticker"], "company": e["company_name"],
             "category": e["category"], "label": e["label"], "headline": e["headline"],
             "summary": e.get("summary", ""), "event_date": e.get("event_date"),
-            "event_time": e.get("event_time"), "country": e.get("country") or "Other",
+            "event_time": e.get("event_time"),
+            "country": company.get("country") or e.get("country") or "Other",
+            "sub_sector": company.get("sub_sector") or "Unclassified",
             "region": e.get("region"), "exchange": e.get("exchange"), "tier": e.get("tier"),
             "primary_url": e.get("primary_url"), "sources": e.get("sources", []),
             "matched_on": e.get("matched_on", []), "status": e.get("status"),
@@ -59,6 +69,7 @@ def build_payload(cfg: dict, roster: dict) -> tuple[list, dict]:
 
     companies = [
         {"ticker": c["ticker"], "name": c["name"], "country": c.get("country") or "Other",
+         "sub_sector": c.get("sub_sector") or "Unclassified",
          "region": c.get("region"), "enabled": c.get("enabled", True)}
         for c in roster.get("companies", [])
     ]
@@ -189,12 +200,26 @@ input[type=text],input[type=date],select{background:var(--panel2);border:1px sol
 .static-note{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 14px;font-size:12.5px;color:var(--muted);margin-bottom:16px}
 .hist-table{width:100%;border-collapse:collapse;font-size:12.5px;margin-top:10px}
 .hist-table th,.hist-table td{border-bottom:1px solid var(--border);padding:6px 8px;text-align:left}
+
+.summary{display:grid;grid-template-columns:repeat(6,1fr);border:1px solid var(--border);border-radius:var(--radius);
+  background:var(--panel);overflow:hidden;margin:18px 0}
+.summary-box{padding:16px 14px;text-align:center;border-right:1px solid var(--border)}
+.summary-box:last-child{border-right:none}
+.summary-num{font-size:24px;font-weight:800;line-height:1}
+.summary-label{font-size:10.5px;color:var(--muted);text-transform:uppercase;letter-spacing:.05em;margin-top:6px}
+.summary-num.c-new{color:var(--accent)}
+.summary-num.c-moved{color:var(--red)}
+.summary-num.c-revised{color:var(--amber)}
+@media (max-width:760px){.summary{grid-template-columns:repeat(3,1fr)}.summary-box:nth-child(3){border-right:none}}
+.co-search{width:100%;margin-bottom:10px}
+.co-list-empty{color:var(--muted);font-size:12.5px;padding:10px 0}
 """
 
 
 def page_html(events: list, meta: dict, live: bool = True) -> str:
     events_json = json.dumps(events, ensure_ascii=False).replace("</script", "<\\/script")
     meta_json = json.dumps(meta, ensure_ascii=False).replace("</script", "<\\/script")
+    history_from = meta.get("history_from") or "2020-01-01"
     static_note = (
         '<div class="static-note">This is a static export. '
         '<b>Refresh now</b> and the company panel need <code>python -m tracker serve</code> '
@@ -219,13 +244,17 @@ def page_html(events: list, meta: dict, live: bool = True) -> str:
 
 <div class="wrap">
   {static_note}
+  <div class="summary" id="summaryRow"></div>
+
   <div class="filters">
-    <div class="filter-row" id="catRow"><span class="filter-label">Category</span></div>
+    <div class="filter-row" id="catRow"><span class="filter-label">Events Category</span></div>
     <div class="filter-row">
       <span class="filter-label">Search</span>
       <input type="text" id="searchBox" placeholder="Ticker or company name…">
       <span class="filter-label" style="min-width:auto">Country</span>
       <select id="countrySel"><option value="">All</option></select>
+      <span class="filter-label" style="min-width:auto">Sub-sector</span>
+      <select id="subSectorSel"><option value="">All</option></select>
     </div>
     <div class="filter-row">
       <span class="filter-label">When</span>
@@ -260,15 +289,21 @@ def page_html(events: list, meta: dict, live: bool = True) -> str:
 <div class="modal-panel" id="companiesPanel">
   <button class="drawer-close" id="companiesClose">&times;</button>
   <h2>Companies</h2>
+  <input type="text" id="coSearch" class="co-search" placeholder="Filter this list by ticker or name…">
   <div id="companiesList"></div>
   <h2 style="margin-top:22px">Add a company</h2>
+  <p style="color:var(--muted);font-size:12px;margin-top:-4px">
+    It's tracked permanently — it stays on this list, in every filter, until you remove it,
+    even after closing or refreshing the page. History back to {history_from} is pulled
+    automatically right after you add it.</p>
   <div class="form-grid">
     <input type="text" id="newTicker" placeholder="Ticker (e.g. 2330.TW)">
     <input type="text" id="newName" placeholder="Company name">
-    <input type="text" id="newIr" class="full" placeholder="Investor relations URL">
+    <input type="text" id="newIr" class="full" placeholder="Investor relations URL (optional)">
     <input type="text" id="newExchange" placeholder="Exchange">
-    <input type="text" id="newCountry" placeholder="Country">
-    <input type="text" id="newCik" placeholder="SEC CIK (US filers only)">
+    <input type="text" id="newCountry" placeholder="Country (e.g. US, Japan, Europe…)">
+    <input type="text" id="newSubSector" placeholder="Sub-sector (e.g. Consumer Staples)">
+    <input type="text" id="newCik" placeholder="SEC CIK (optional — auto-resolved if US and left blank)">
     <input type="text" id="newAliases" placeholder="Aliases, comma separated">
   </div>
   <button class="btn primary small" id="addCoBtn" style="margin-top:10px">Add company</button>
@@ -292,7 +327,7 @@ const META = {meta_json};
 
 _JS = r"""
 const TIER_LABEL = {regulatory:'Regulatory', company_ir:'Company IR', newswire:'Newswire', news:'News'};
-let state = { categories: new Set(META.categories.map(c=>c.key)), search:'', country:'',
+let state = { categories: new Set(META.categories.map(c=>c.key)), search:'', country:'', subSector:'',
               from:'', to:'', changedOnly:false, newOnly:false, showPast:true };
 let liveOk = false;
 
@@ -319,12 +354,16 @@ function buildCatRow(){
   const countrySel = document.getElementById('countrySel');
   const countries = [...new Set(META.companies.map(c=>c.country).filter(Boolean))].sort();
   countries.forEach(c=>{ const o=document.createElement('option'); o.value=c; o.textContent=c; countrySel.appendChild(o); });
+  const subSel = document.getElementById('subSectorSel');
+  const subSectors = [...new Set(META.companies.map(c=>c.sub_sector).filter(Boolean))].sort();
+  subSectors.forEach(s=>{ const o=document.createElement('option'); o.value=s; o.textContent=s; subSel.appendChild(o); });
 }
 
 function applyFilters(list){
   return list.filter(e=>{
     if(!state.categories.has(e.category)) return false;
     if(state.country && e.country !== state.country) return false;
+    if(state.subSector && e.sub_sector !== state.subSector) return false;
     if(state.changedOnly && !['date_moved','updated'].includes(e.status)) return false;
     if(state.newOnly && e.status !== 'new') return false;
     if(state.search){
@@ -336,6 +375,36 @@ function applyFilters(list){
     if((state.from || state.to) && !e.event_date) return false;
     return true;
   });
+}
+
+function computeSummary(){
+  const today = todayStr();
+  const in7 = new Date(Date.now()+7*86400000).toISOString().slice(0,10);
+  const in31 = new Date(Date.now()+31*86400000).toISOString().slice(0,10);
+  let counts = { new:0, date_moved:0, updated:0, up7:0, up31:0 };
+  EVENTS.forEach(e=>{
+    if(e.status==='new') counts.new++;
+    if(e.status==='date_moved') counts.date_moved++;
+    if(e.status==='updated') counts.updated++;
+    if(e.event_date && e.event_date>=today && e.event_date<=in7) counts.up7++;
+    if(e.event_date && e.event_date>=today && e.event_date<=in31) counts.up31++;
+  });
+  return counts;
+}
+
+function renderSummary(){
+  const c = computeSummary();
+  const tracked = META.companies.length;
+  const boxes = [
+    ['c-new', c.new, 'New'],
+    ['c-moved', c.date_moved, 'Date Moved'],
+    ['c-revised', c.updated, 'Revised'],
+    ['', c.up7, 'Upcoming (7d)'],
+    ['', c.up31, 'Upcoming (31d)'],
+    ['', tracked, 'Tracked'],
+  ];
+  document.getElementById('summaryRow').innerHTML = boxes.map(([cls,num,label])=>
+    `<div class="summary-box"><div class="summary-num ${cls}">${num}</div><div class="summary-label">${label}</div></div>`).join('');
 }
 
 function railClass(e){ return 'rail-' + (e.tier || 'news'); }
@@ -371,6 +440,7 @@ function groupByCountry(list){
 }
 
 function render(){
+  renderSummary();
   const today = todayStr();
   const filtered = applyFilters(EVENTS);
 
@@ -426,6 +496,7 @@ function openDrawer(e){
       <b>Date</b><span>${e.event_date || 'Undated'}</span>
       <b>Time</b><span>${e.event_time || (e.event_date && e.event_date < todayStr() ? 'NA' : 'TIME TBC')}</span>
       <b>Country</b><span>${escapeHtml(e.country)}</span>
+      <b>Sub-sector</b><span>${escapeHtml(e.sub_sector||'—')}</span>
       <b>Exchange</b><span>${escapeHtml(e.exchange||'—')}</span>
       <b>Status</b><span>${e.status}</span>
       <b>First seen</b><span>${e.first_seen_sgt||''} SGT</span>
@@ -447,14 +518,16 @@ function closePanel(id){ document.getElementById(id).classList.remove('open'); d
 
 document.getElementById('searchBox').oninput = e=>{ state.search = e.target.value; render(); };
 document.getElementById('countrySel').onchange = e=>{ state.country = e.target.value; render(); };
+document.getElementById('subSectorSel').onchange = e=>{ state.subSector = e.target.value; render(); };
 document.getElementById('changedOnly').onchange = e=>{ state.changedOnly = e.target.checked; render(); };
 document.getElementById('newOnly').onchange = e=>{ state.newOnly = e.target.checked; render(); };
 document.getElementById('showPast').onchange = e=>{ state.showPast = e.target.checked; render(); };
 document.getElementById('fromDate').onchange = e=>{ state.from = e.target.value; render(); };
 document.getElementById('toDate').onchange = e=>{ state.to = e.target.value; render(); };
 document.getElementById('clearBtn').onclick = ()=>{
-  state.search=''; state.country=''; state.from=''; state.to=''; state.changedOnly=false; state.newOnly=false; state.showPast=true;
+  state.search=''; state.country=''; state.subSector=''; state.from=''; state.to=''; state.changedOnly=false; state.newOnly=false; state.showPast=true;
   document.getElementById('searchBox').value=''; document.getElementById('countrySel').value='';
+  document.getElementById('subSectorSel').value='';
   document.getElementById('fromDate').value=''; document.getElementById('toDate').value='';
   document.getElementById('changedOnly').checked=false; document.getElementById('newOnly').checked=false;
   document.getElementById('showPast').checked=true;
@@ -487,26 +560,51 @@ document.getElementById('companiesBtn').onclick = ()=>{
 };
 document.getElementById('companiesClose').onclick = ()=> closePanel('companiesPanel');
 
+let companiesCache = [];
+const CO_LIST_CAP = 300;   // roster can run into the thousands; render a capped, search-filtered slice
+
 function loadCompanies(){
+  const list = document.getElementById('companiesList');
+  list.innerHTML = '<div class="co-list-empty">Loading…</div>';
   fetch('/api/companies').then(r=>r.json()).then(data=>{
-    const list = document.getElementById('companiesList');
-    list.innerHTML = (data.companies||[]).map(c=>`
-      <div class="co-row ${c.enabled? '' : 'paused'}">
-        <div style="flex:1"><div class="n">${escapeHtml(c.ticker)} — ${escapeHtml(c.name)}</div>
-        <div class="s">${c.source_count||0} sources · ${c.enabled? 'active':'paused'}</div></div>
-        <button class="btn small" data-act="toggle" data-ticker="${c.ticker}" data-enabled="${!c.enabled}">${c.enabled?'Pause':'Resume'}</button>
-        <button class="btn small" data-act="remove" data-ticker="${c.ticker}">Remove</button>
-      </div>`).join('');
-    list.querySelectorAll('[data-act]').forEach(btn=>{
-      btn.onclick = ()=>{
-        const act = btn.dataset.act, ticker = btn.dataset.ticker;
-        const body = act==='toggle' ? {ticker, enabled: btn.dataset.enabled==='true'} : {ticker};
-        fetch('/api/companies/'+act, {method:'POST', body: JSON.stringify(body)})
-          .then(r=>r.json()).then(()=> loadCompanies());
-      };
-    });
+    companiesCache = data.companies || [];
+    renderCompaniesList();
   });
 }
+
+function renderCompaniesList(){
+  const list = document.getElementById('companiesList');
+  const q = (document.getElementById('coSearch').value || '').trim().toLowerCase();
+  let matches = q
+    ? companiesCache.filter(c => c.ticker.toLowerCase().includes(q) || c.name.toLowerCase().includes(q))
+    : companiesCache;
+  const total = matches.length;
+  const shown = matches.slice(0, CO_LIST_CAP);
+  const note = total > CO_LIST_CAP
+    ? `<div class="co-list-empty">Showing ${CO_LIST_CAP} of ${total} matches — narrow your search to see more.</div>` : '';
+  if(!companiesCache.length){
+    list.innerHTML = '<div class="co-list-empty">No companies tracked yet.</div>';
+    return;
+  }
+  list.innerHTML = `<div class="co-list-empty">${companiesCache.length} companies tracked${q ? `, ${total} match "${escapeHtml(q)}"` : ''}</div>` +
+    shown.map(c=>`
+      <div class="co-row ${c.enabled? '' : 'paused'}">
+        <div style="flex:1"><div class="n">${escapeHtml(c.ticker)} — ${escapeHtml(c.name)}</div>
+        <div class="s">${escapeHtml(c.country||'')}${c.sub_sector? ' · '+escapeHtml(c.sub_sector):''} · ${c.source_count||0} sources · ${c.enabled? 'active':'paused'}</div></div>
+        <button class="btn small" data-act="toggle" data-ticker="${escapeHtml(c.ticker)}" data-enabled="${!c.enabled}">${c.enabled?'Pause':'Resume'}</button>
+        <button class="btn small" data-act="remove" data-ticker="${escapeHtml(c.ticker)}">Remove</button>
+      </div>`).join('') + note;
+  list.querySelectorAll('[data-act]').forEach(btn=>{
+    btn.onclick = ()=>{
+      const act = btn.dataset.act, ticker = btn.dataset.ticker;
+      const body = act==='toggle' ? {ticker, enabled: btn.dataset.enabled==='true'} : {ticker};
+      fetch('/api/companies/'+act, {method:'POST', body: JSON.stringify(body)})
+        .then(r=>r.json()).then(()=> loadCompanies());
+    };
+  });
+}
+document.getElementById('coSearch').oninput = renderCompaniesList;
+
 document.getElementById('addCoBtn').onclick = ()=>{
   const msg = document.getElementById('addCoMsg'); msg.textContent = 'Adding…'; msg.className='msg';
   const body = {
@@ -515,6 +613,7 @@ document.getElementById('addCoBtn').onclick = ()=>{
     ir: document.getElementById('newIr').value.trim(),
     exchange: document.getElementById('newExchange').value.trim(),
     country: document.getElementById('newCountry').value.trim(),
+    sub_sector: document.getElementById('newSubSector').value.trim(),
     cik: document.getElementById('newCik').value.trim(),
     aliases: document.getElementById('newAliases').value.trim(),
   };
@@ -522,7 +621,7 @@ document.getElementById('addCoBtn').onclick = ()=>{
   fetch('/api/companies/add', {method:'POST', body: JSON.stringify(body)}).then(r=>r.json()).then(res=>{
     msg.textContent = res.message || (res.ok? 'Added.' : 'Could not add company.');
     msg.className = 'msg ' + (res.ok? 'ok':'err');
-    if(res.ok){ ['newTicker','newName','newIr','newExchange','newCountry','newCik','newAliases'].forEach(id=>document.getElementById(id).value='');
+    if(res.ok){ ['newTicker','newName','newIr','newExchange','newCountry','newSubSector','newCik','newAliases'].forEach(id=>document.getElementById(id).value='');
       loadCompanies(); }
   });
 };

@@ -8,6 +8,7 @@ untouched.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import tempfile
@@ -16,7 +17,33 @@ import yaml
 
 from .sources import make_session
 
-_BLOCK_RE_TMPL = r"(\n[ \t]*-\s*ticker:\s*{ticker}\b.*?)(?=\n[ \t]*-\s*ticker:|\Z)"
+# Ticker may or may not be quoted in the file (see yaml_scalar below), so
+# the block finder tolerates both — \b sits right after the ticker itself,
+# before any closing quote, since \b never matches between two non-word
+# characters (a quote followed by a newline, say).
+_BLOCK_RE_TMPL = r"(\n[ \t]*-\s*ticker:\s*[\"']?{ticker}\b[\"']?.*?)(?=\n[ \t]*-\s*ticker:|\Z)"
+
+# A roster of thousands of companies takes real time to parse with PyYAML's
+# pure-Python loader; the libyaml-backed one (when available) is far
+# faster, and every add/pause/remove here re-parses the whole file at
+# least once to validate it.
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+
+def _yaml_load(text: str) -> dict:
+    return yaml.load(text, Loader=_YAML_LOADER) or {}
+
+
+def yaml_scalar(value) -> str:
+    """A YAML double-quoted scalar for any string. Always quoting is
+    cheaper and safer than trying to detect which values need it — plain
+    `ticker: ON` silently becomes the boolean `true` under YAML 1.1 (same
+    for NO/YES/OFF/NULL/…, the classic "Norway problem"), and ON
+    Semiconductor's own ticker is literally "ON". JSON string escaping
+    produces a valid YAML double-quoted scalar for any input, colons and
+    all, without needing a YAML-dumper round trip that would reformat the
+    rest of the file."""
+    return json.dumps(str(value), ensure_ascii=False)
 
 
 def _read(path: str) -> str:
@@ -39,7 +66,7 @@ def _write_atomic(path: str, text: str):
 
 def _validate(text: str) -> tuple[bool, str]:
     try:
-        data = yaml.safe_load(text) or {}
+        data = _yaml_load(text)
     except yaml.YAMLError as exc:
         return False, f"That change would produce invalid YAML: {exc}"
     companies = data.get("companies", [])
@@ -50,12 +77,17 @@ def _validate(text: str) -> tuple[bool, str]:
 
 
 def list_companies(companies_path: str) -> list:
-    data = yaml.safe_load(_read(companies_path)) or {}
+    # The read-only listing path is hit far more often than adds/edits (the
+    # companies panel re-fetches it after every action), so it goes through
+    # pipeline.load_yaml's mtime cache instead of a fresh parse each time.
+    from .pipeline import load_yaml
+    data = load_yaml(companies_path)
     out = []
     for c in data.get("companies", []):
         out.append({
             "ticker": c.get("ticker"), "name": c.get("name"),
             "exchange": c.get("exchange", ""), "country": c.get("country", ""),
+            "sub_sector": c.get("sub_sector", ""),
             "region": c.get("region", ""), "enabled": c.get("enabled", True),
             "source_count": len(c.get("sources", [])),
         })
@@ -124,17 +156,19 @@ def _probe_rss(ir_url: str, cfg: dict | None) -> str | None:
 
 
 def _format_block(ticker: str, name: str, exchange: str, region: str, country: str,
-                   aliases: list, sources: list) -> str:
-    lines = [f"\n  - ticker: {ticker}", f"    name: {name}"]
+                   sub_sector: str, aliases: list, sources: list) -> str:
+    lines = [f"\n  - ticker: {yaml_scalar(ticker)}", f"    name: {yaml_scalar(name)}"]
     if exchange:
-        lines.append(f"    exchange: {exchange}")
+        lines.append(f"    exchange: {yaml_scalar(exchange)}")
     if region:
-        lines.append(f"    region: {region}")
+        lines.append(f"    region: {yaml_scalar(region)}")
     if country:
-        lines.append(f"    country: {country}")
+        lines.append(f"    country: {yaml_scalar(country)}")
+    if sub_sector:
+        lines.append(f"    sub_sector: {yaml_scalar(sub_sector)}")
     lines.append("    enabled: true")
     if aliases:
-        alias_list = ", ".join(f'"{a}"' for a in aliases)
+        alias_list = ", ".join(yaml_scalar(a) for a in aliases)
         lines.append(f"    aliases: [{alias_list}]")
     lines.append("    sources:")
     for s in sources:
@@ -148,7 +182,7 @@ def _format_block(ticker: str, name: str, exchange: str, region: str, country: s
 
 
 def add_company(ticker: str, name: str, *, ir_url: str | None = None, exchange: str = "",
-                 region: str = "", country: str = "", cik: str | None = None,
+                 region: str = "", country: str = "", sub_sector: str = "", cik: str | None = None,
                  aliases: list | None = None, no_news: bool = False,
                  config_path: str | None = None, companies_path: str = "companies.yaml") -> dict:
     ticker = (ticker or "").strip()
@@ -162,7 +196,7 @@ def add_company(ticker: str, name: str, *, ir_url: str | None = None, exchange: 
 
     cfg = None
     if config_path and os.path.exists(config_path):
-        cfg = yaml.safe_load(_read(config_path)) or {}
+        cfg = _yaml_load(_read(config_path))
 
     sources = []
     if ir_url:
@@ -176,13 +210,18 @@ def add_company(ticker: str, name: str, *, ir_url: str | None = None, exchange: 
             })
     if cik:
         sources.append({"type": "sec_edgar", "tier": "regulatory", "cik": f'"{str(cik).strip()}"'})
+    elif country.strip().lower() in ("us", "united states", "usa"):
+        # No CIK given, but this reads as a US-listed company — a
+        # `sec_edgar` source with no `cik:` auto-resolves one from the
+        # ticker at fetch time (see tracker/sources.py resolve_cik).
+        sources.append({"type": "sec_edgar", "tier": "regulatory"})
     if not no_news:
         sources.append({"type": "news", "tier": "news"})
 
     if not sources:
         return {"ok": False, "message": "Add at least an IR URL or a SEC CIK."}
 
-    block = _format_block(ticker, name, exchange, region, country, aliases or [], [])
+    block = _format_block(ticker, name, exchange, region, country, sub_sector, aliases or [], [])
     # ir_page needs nested selector lines that _format_block's flat writer
     # can't express, so splice that source's YAML in by hand.
     body_lines = block.splitlines()
@@ -199,7 +238,9 @@ def add_company(ticker: str, name: str, *, ir_url: str | None = None, exchange: 
         elif s["type"] == "rss":
             src_lines += ["      - type: rss", "        tier: company_ir", f"        url: {s['url']}"]
         elif s["type"] == "sec_edgar":
-            src_lines += ["      - type: sec_edgar", "        tier: regulatory", f"        cik: {s['cik']}"]
+            src_lines += ["      - type: sec_edgar", "        tier: regulatory"]
+            if s.get("cik"):
+                src_lines.append(f"        cik: {s['cik']}")
         elif s["type"] == "news":
             src_lines += ["      - type: news", "        tier: news"]
     body_lines[insert_at:insert_at] = src_lines

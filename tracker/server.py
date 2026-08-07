@@ -87,7 +87,7 @@ class RefreshManager:
         return _now() - last > timedelta(minutes=mins)
 
     def maybe_refresh(self, force: bool = False) -> bool:
-        """Start a refresh if one isn't already going. Returns True if started."""
+        """Start a full refresh if one isn't already going. Returns True if started."""
         if self.running:
             return False
         if not force and not self.is_stale():
@@ -96,24 +96,41 @@ class RefreshManager:
             if self.running:
                 return False
             self.running = True
-        threading.Thread(target=self._work, daemon=True).start()
+        threading.Thread(target=self._work, args=(None,), daemon=True).start()
         return True
 
-    def _work(self):
+    def start_scoped(self, ticker: str) -> bool:
+        """Fetch one company's full history right away — used right after
+        it's added, so its events show up without waiting for the next
+        stale-triggered or daily refresh. Skipped (not queued) if a refresh
+        is already running; that company still gets picked up by it, or by
+        the next one, since it's already in companies.yaml by then."""
+        if self.running:
+            return False
+        with self.lock:
+            if self.running:
+                return False
+            self.running = True
+        threading.Thread(target=self._work, args=(ticker,), daemon=True).start()
+        return True
+
+    def _work(self, only_ticker: str | None):
         started = time.time()
         try:
-            cfg = self.cfg()
-            roster = self.roster()
-            names = [c["ticker"] for c in roster.get("companies", []) if c.get("enabled", True)]
-            n_sources = sum(len(c.get("sources", [])) for c in roster.get("companies", [])
-                           if c.get("enabled", True))
-            self.message = f"starting · {len(names)} companies, {n_sources} sources"
+            if only_ticker:
+                self.message = f"pulling history for {only_ticker}…"
+            else:
+                roster = self.roster()
+                names = [c["ticker"] for c in roster.get("companies", []) if c.get("enabled", True)]
+                n_sources = sum(len(c.get("sources", [])) for c in roster.get("companies", [])
+                               if c.get("enabled", True))
+                self.message = f"starting · {len(names)} companies, {n_sources} sources"
 
             def progress(done, total, label):
                 self.message = f"{done} of {total} sources · {label}"
 
             run_pipeline(self.config_path, self.companies_path,
-                         verbose=False, progress=progress)
+                         verbose=False, progress=progress, only_ticker=only_ticker)
             self.last_error = ""
         except Exception as exc:
             self.last_error = str(exc)[:200]
@@ -283,10 +300,17 @@ class Handler(BaseHTTPRequestHandler):
                         exchange=body.get("exchange", ""),
                         region=body.get("region", ""),
                         country=body.get("country", ""),
+                        sub_sector=body.get("sub_sector", ""),
                         cik=body.get("cik") or None,
                         aliases=[a.strip() for a in (body.get("aliases") or "").split(",") if a.strip()],
                         no_news=bool(body.get("no_news")),
                         config_path=m.config_path, companies_path=m.companies_path)
+                    if result.get("ok"):
+                        started = m.start_scoped(body.get("ticker", "").strip())
+                        result["message"] = result["message"] + (
+                            " Pulling its history now — it'll appear as soon as that finishes."
+                            if started else
+                            " A refresh is already running; its history will follow that, or press Refresh now once it's done.")
                 elif action == "toggle":
                     result = addco.set_enabled(body.get("ticker", ""),
                                                bool(body.get("enabled")),
@@ -317,6 +341,14 @@ def serve(config_path="config.yaml", companies_path="companies.yaml",
     manager = RefreshManager(config_path, companies_path)
     Handler.manager = manager
     cfg = manager.cfg()
+    # Parsing companies.yaml is the one part of a page view that scales with
+    # roster size — cheap for a handful of companies, a real fraction of a
+    # second (or a few, with a roster in the thousands) for a big one. Pay
+    # that cost once here rather than on whichever browser tab happens to
+    # be first; every request after this hits the warm cache.
+    print("Loading companies.yaml...")
+    n_companies = len(manager.roster().get("companies", []))
+    print(f"Tracking {n_companies} companies.")
 
     # A host like Render assigns the port at run time and tells the app via
     # $PORT. It also routes traffic from outside the container, so binding to

@@ -13,7 +13,9 @@ from __future__ import annotations
 
 import difflib
 import os
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import yaml
 
@@ -23,9 +25,32 @@ from .sources import FETCHERS, link_is_alive, make_session
 from .store import Store
 
 
+_YAML_LOADER = getattr(yaml, "CSafeLoader", yaml.SafeLoader)
+
+# A roster of a few thousand companies takes real, measurable time to parse
+# (multi-second with PyYAML's pure-Python loader), and load_yaml is called
+# on every single page view via server.py — so cache by path, keyed on the
+# file's mtime. A hand edit or an addco.py write changes the mtime, which
+# invalidates the cache automatically; nothing else needs to know caching
+# is happening at all.
+_yaml_cache: dict[str, tuple[float | None, dict]] = {}
+_yaml_cache_lock = threading.Lock()
+
+
 def load_yaml(path: str) -> dict:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = None
+    with _yaml_cache_lock:
+        cached = _yaml_cache.get(path)
+        if cached is not None and cached[0] == mtime:
+            return cached[1]
     with open(path, "r", encoding="utf-8") as fh:
-        return yaml.safe_load(fh) or {}
+        data = yaml.load(fh, Loader=_YAML_LOADER) or {}
+    with _yaml_cache_lock:
+        _yaml_cache[path] = (mtime, data)
+    return data
 
 
 def _title_similar(a: str, b: str) -> bool:
@@ -123,6 +148,7 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
 
     news_enabled = (cfg.get("news", {}) or {}).get("enabled", True) and not no_news
     max_run_seconds = float(cfg.get("run", {}).get("max_run_seconds", 240))
+    max_workers = max(1, int(cfg.get("run", {}).get("max_workers", 8)))
     started = time.time()
 
     all_sources = []
@@ -136,61 +162,88 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
     store = Store(cfg["output"]["db_path"])
     run_id = store.start_run()
 
-    classified_items = []
-    skipped_companies = []
+    # Every (company, source) fetch is independent, so they run on a bounded
+    # thread pool — different hosts overlap freely, requests to the *same*
+    # host still queue behind that host's own delay (sources._be_polite is
+    # lock-protected for exactly this). progress_lock guards the shared
+    # counters below since several worker threads update them concurrently.
+    classified_items: list = []
+    skipped_companies: list = []
+    progress_lock = threading.Lock()
     done = 0
     out_of_time = False
-    for c, s in all_sources:
-        done += 1
-        label = f"{c['ticker']} · {s['type']}"
-        if progress:
-            progress(done, total, label)
-        if verbose:
-            print(f"[{done}/{total}] {label}")
 
-        if time.time() - started > max_run_seconds:
-            out_of_time = True
-            if c["ticker"] not in skipped_companies:
-                skipped_companies.append(c["ticker"])
-            continue
-
+    def fetch_one(c, s):
         fetcher = FETCHERS.get(s["type"])
         if fetcher is None:
-            continue
-        try:
-            if s["type"] == "news":
-                items = fetcher(s, c, cfg, session, allowed_domains)
-            else:
-                items = fetcher(s, c, cfg, session)
-        except Exception as exc:
-            if verbose:
-                print(f"    ! {label} failed: {exc}")
-            continue
+            return c, s, []
+        if s["type"] == "news":
+            return c, s, fetcher(s, c, cfg, session, allowed_domains)
+        return c, s, fetcher(s, c, cfg, session)
 
-        for item in items:
-            ci = classifier.classify(item)
-            if ci is not None:
-                classified_items.append(ci)
+    with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        futures = {}
+        for c, s in all_sources:
+            if time.time() - started > max_run_seconds:
+                out_of_time = True
+                skipped_companies.append(c["ticker"])
+                continue
+            futures[pool.submit(fetch_one, c, s)] = (c, s)
+
+        for future in as_completed(futures):
+            c, s = futures[future]
+            label = f"{c['ticker']} · {s['type']}"
+            with progress_lock:
+                done += 1
+                current_done = done
+            if progress:
+                progress(current_done, total, label)
+            if verbose:
+                print(f"[{current_done}/{total}] {label}")
+
+            try:
+                _, _, items = future.result()
+            except Exception as exc:
+                if verbose:
+                    print(f"    ! {label} failed: {exc}")
+                continue
+
+            classified = [ci for item in items if (ci := classifier.classify(item)) is not None]
+            with progress_lock:
+                classified_items.extend(classified)
+
+    if out_of_time:
+        with progress_lock:
+            skipped_companies = sorted(set(skipped_companies))
 
     grouped = _group_into_events(classified_items, cfg)
 
     # Verify every surviving link is actually live before it can reach the
     # page. An event that loses its only link is dropped rather than shown
-    # pointing somewhere dead.
+    # pointing somewhere dead. Same bounded-concurrency approach as fetching.
+    def check_one(g):
+        live = [s for s in g["sources"] if link_is_alive(session, s["url"], cfg)]
+        return g, live
+
     kept = []
-    for g in grouped:
-        if time.time() - started > max_run_seconds:
-            out_of_time = True
-            break
-        live_sources = [s for s in g["sources"] if link_is_alive(session, s["url"], cfg)]
-        if not live_sources:
-            continue
-        live_urls = {s["url"] for s in live_sources}
-        if g["event"]["primary_url"] not in live_urls:
-            live_sources.sort(key=lambda s: tier_priority(s["tier"]))
-            g["event"]["primary_url"] = live_sources[0]["url"]
-        g["sources"] = live_sources
-        kept.append(g)
+    if time.time() - started <= max_run_seconds:
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            futures = [pool.submit(check_one, g) for g in grouped]
+            for future in as_completed(futures):
+                if time.time() - started > max_run_seconds:
+                    out_of_time = True
+                    continue
+                g, live_sources = future.result()
+                if not live_sources:
+                    continue
+                live_urls = {s["url"] for s in live_sources}
+                if g["event"]["primary_url"] not in live_urls:
+                    live_sources.sort(key=lambda s: tier_priority(s["tier"]))
+                    g["event"]["primary_url"] = live_sources[0]["url"]
+                g["sources"] = live_sources
+                kept.append(g)
+    else:
+        out_of_time = True
 
     new_count = 0
     changed_count = 0

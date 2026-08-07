@@ -10,6 +10,7 @@ content source.
 from __future__ import annotations
 
 import re
+import threading
 import time
 import urllib.parse
 from datetime import datetime, date
@@ -29,8 +30,12 @@ _TIME_RE = re.compile(
 )
 
 # One clock per host, so requests to the same site stay spaced out even
-# across different companies/sources that happen to share a domain.
+# across different companies/sources that happen to share a domain — and
+# across worker threads, since a run with many companies fetches several
+# hosts concurrently (see pipeline.py). The lock only ever guards a dict
+# read/write, never the sleep itself, so it doesn't serialise unrelated hosts.
 _last_hit: dict[str, float] = {}
+_last_hit_lock = threading.Lock()
 
 
 def _host(url: str) -> str:
@@ -40,17 +45,30 @@ def _host(url: str) -> str:
         return ""
 
 
-def _be_polite(url: str, delay: float):
+def _delay_for(host: str, cfg: dict) -> float:
+    overrides = (cfg.get("run", {}) or {}).get("host_delay_overrides", {}) or {}
+    if host in overrides:
+        return float(overrides[host])
+    return float((cfg.get("run", {}) or {}).get("polite_delay_seconds", 1.0))
+
+
+def _be_polite(url: str, cfg: dict):
     host = _host(url)
+    delay = _delay_for(host, cfg)
     if not host or delay <= 0:
         return
-    last = _last_hit.get(host)
-    now = time.monotonic()
-    if last is not None:
-        wait = delay - (now - last)
-        if wait > 0:
-            time.sleep(wait)
-    _last_hit[host] = time.monotonic()
+    # Reserve a slot exactly once, under the lock, then sleep to it outside
+    # the lock. A thread must never re-read the shared marker after this —
+    # doing that let concurrent callers keep pushing each other's wake time
+    # forward (an earlier version of this function livelocked that way).
+    with _last_hit_lock:
+        now = time.monotonic()
+        last = _last_hit.get(host)
+        next_slot = now if last is None else max(now, last + delay)
+        _last_hit[host] = next_slot
+    wait = next_slot - time.monotonic()
+    if wait > 0:
+        time.sleep(wait)
 
 
 def make_session(user_agent: str) -> requests.Session:
@@ -61,8 +79,7 @@ def make_session(user_agent: str) -> requests.Session:
 
 def _get(session: requests.Session, url: str, cfg: dict, **kw):
     timeout = tuple(cfg.get("run", {}).get("request_timeout", [6, 15]))
-    delay = float(cfg.get("run", {}).get("polite_delay_seconds", 1.0))
-    _be_polite(url, delay)
+    _be_polite(url, cfg)
     return session.get(url, timeout=timeout, **kw)
 
 
@@ -71,14 +88,13 @@ def link_is_alive(session: requests.Session, url: str, cfg: dict) -> bool:
     if not url:
         return False
     timeout = tuple(cfg.get("run", {}).get("request_timeout", [6, 15]))
-    delay = float(cfg.get("run", {}).get("polite_delay_seconds", 1.0))
     try:
-        _be_polite(url, delay)
+        _be_polite(url, cfg)
         r = session.head(url, timeout=timeout, allow_redirects=True)
         if r.status_code < 400:
             return True
         if r.status_code in (405, 403):
-            _be_polite(url, delay)
+            _be_polite(url, cfg)
             r = session.get(url, timeout=timeout, stream=True)
             r.close()
             return r.status_code < 400
@@ -223,9 +239,52 @@ _SEC_FORM_HINT = {"8-K": "regulatory event", "6-K": "regulatory event",
                    "DEF 14A": "proxy statement", "DEFA14A": "proxy statement",
                    "425": "merger filing", "SC 14D9": "tender offer filing"}
 
+_NON_US_SUFFIXES = (".HK", ".TW", ".T", ".KS", ".CH")
+
+# SEC's own ticker->CIK map, fetched once per process and shared by every
+# company that needs it — a `sec_edgar` source doesn't have to carry an
+# explicit `cik:` any more, it can resolve one from the company's ticker.
+_cik_map: Optional[dict] = None
+_cik_map_lock = threading.Lock()
+
+
+def _load_cik_map(session: requests.Session, cfg: dict) -> dict:
+    global _cik_map
+    with _cik_map_lock:
+        if _cik_map is not None:
+            return _cik_map
+        try:
+            r = _get(session, "https://www.sec.gov/files/company_tickers.json", cfg)
+            r.raise_for_status()
+            data = r.json()
+            _cik_map = {
+                str(rec.get("ticker", "")).upper().strip(): str(rec.get("cik_str", "")).zfill(10)
+                for rec in data.values()
+                if rec.get("ticker") and rec.get("cik_str")
+            }
+        except Exception as exc:
+            print(f"[sec_edgar] couldn't load SEC's ticker list, CIK auto-resolve is off this run: {exc}")
+            _cik_map = {}
+        return _cik_map
+
+
+def resolve_cik(session: requests.Session, cfg: dict, ticker: str) -> Optional[str]:
+    base = ticker.strip().upper()
+    for suffix in _NON_US_SUFFIXES:
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return _load_cik_map(session, cfg).get(base)
+
 
 def fetch_sec_edgar(source: dict, company: dict, cfg: dict, session: requests.Session) -> list[RawItem]:
-    cik = str(source.get("cik", "")).strip().zfill(10)
+    cik = str(source.get("cik") or "").strip()
+    if cik:
+        cik = cik.zfill(10)
+    else:
+        cik = resolve_cik(session, cfg, company["ticker"])
+        if not cik:
+            return []
     if not cik.strip("0"):
         return []
     url = f"https://data.sec.gov/submissions/CIK{cik}.json"

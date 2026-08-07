@@ -4,33 +4,51 @@
 # =============================================================================
 
 run:
-  # Keep every event from this date onward. 2026-01-01 gives you the full year
-  # to date; move it back to 2025-01-01 if you want more history.
   # Keep every event from this date onward.
   #
   # How far back you actually get depends on the source, not just this setting:
-  #   sec_edgar  reaches back years — the workhorse for backfilling history
+  #   sec_edgar  reaches back years — the workhorse for backfilling history,
+  #              and auto-resolves its own CIK from a US ticker (see below)
   #   rss        only what the feed currently carries, typically 20-50 items
   #   ir_page    only what's on the page you pointed it at
   #   news       last 30 days only (it's corroboration, not an archive)
-  # So for real 2026 history, give US-listed companies a `sec_edgar` source
-  # with their CIK. Companies that don't file with the SEC (most HK, JP and TW
-  # names) will only fill in from the day you start running this daily.
-  history_from: "2026-01-01"
-  lookahead_days: 400         # keep scheduled events this far into the future
+  # So for real history back to 2020, give US-listed companies a `sec_edgar`
+  # source. Companies that don't file with the SEC (most HK, JP, TW, KR and
+  # CN names) will only fill in from the day you start running this daily,
+  # unless you add a company_ir source with real history of its own.
+  history_from: "2020-01-01"
+  lookahead_days: 730         # keep scheduled events this far into the future
   # (connect, read) seconds. A slow or silently-dropping host fails fast on
   # the connect leg rather than eating its full timeout twice.
   request_timeout: [6, 15]
   polite_delay_seconds: 1.0   # pause between requests to the same host
+  # A handful of large public endpoints (SEC EDGAR, Google News) are shared
+  # by every company using them, so the plain per-host delay above would
+  # serialise thousands of companies behind one clock. Both publish (or
+  # tolerate) faster access than a small company IR site would want — SEC's
+  # published fair-access guideline is up to 10 requests/second — so they
+  # get their own, still-polite, delay instead of the default.
+  host_delay_overrides:
+    data.sec.gov: 0.12
+    news.google.com: 0.4
+  # How many (company, source) fetches run at once. Different hosts run
+  # concurrently; requests to the *same* host still queue behind that host's
+  # delay above, so this mainly helps when tracking many companies spread
+  # across many different IR domains.
+  max_workers: 12
   # Raised so a full year of SEC filings can come back in one pull. RSS feeds
   # cap themselves (most carry 20-50 recent items) so this mainly affects
   # EDGAR, which is the one source that genuinely reaches back years.
   max_items_per_source: 250
   # Hard ceiling on a single refresh, wall-clock. Once hit, the run finishes
   # cleanly with whatever it has — remaining companies are skipped and listed
-  # in the run's notes, not left hanging. Raise this if you track many
-  # companies and regularly see "skipped: ran out of time".
-  max_run_seconds: 240
+  # in the run's notes, picked up on the next refresh rather than left
+  # hanging. With a roster of ~2,900 companies nearly all sharing the same
+  # news.google.com host (rate-limited by host_delay_overrides above), a
+  # full pass takes roughly 20 minutes; 1800s gives that headroom to finish
+  # in one run rather than needing two. It's a background thread either
+  # way — the page stays responsive while this runs.
+  max_run_seconds: 1800
   user_agent: "CorporateEventTracker/1.0 (research use; contact: you@example.com)"
   # ^ SEC EDGAR requires a real contact address in the User-Agent. Put yours in.
 

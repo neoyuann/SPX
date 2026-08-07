@@ -8,6 +8,14 @@ The point isn't just to collect events. It's to notice when one **moves**: a
 capital markets day pushed back three weeks, guidance quietly revised, an AGM
 date changed. That's what the database is for.
 
+`companies.yaml` currently tracks roughly 2,900 companies across Korea, Japan,
+China, Taiwan, Hong Kong, the US and a handful of European names, bulk-loaded
+from a roster spreadsheet (see **Bulk-importing a roster spreadsheet** below)
+plus a few hand-tuned entries with real IR feeds. History goes back to
+`run.history_from` (2020-01-01 by default) as far as each company's sources
+actually reach — see **Only official sources** below for what that means in
+practice per market.
+
 ---
 
 ## Start here
@@ -115,16 +123,27 @@ copy — but the data itself is identical either way.
 hand for day-to-day changes.** Press **+ Add / remove companies** in the bar
 at the top. That opens a panel with:
 
-- Every company currently tracked, with its source count
+- Every company currently tracked, with its source count — filterable by a
+  search box, since the roster runs into the thousands
 - **Pause** on each — stops fetching it, keeps its past events
 - **Remove** on each — same, plus takes it off the list entirely
-- A form to add a new one: ticker, company name, investor relations URL,
-  exchange, country, an optional SEC CIK for US filers, and other names the
-  press uses for it
+- A form to add a new one: ticker, company name, investor relations URL
+  (optional), exchange, country, sub-sector, an optional SEC CIK, and other
+  names the press uses for it
 
 Submit the form and the tracker probes the IR site for a news feed — that
-takes a few seconds — then writes the entry. Changes apply on the next
-refresh; you don't restart anything.
+takes a few seconds — then writes the entry and **immediately starts a
+background fetch scoped to just that company**, pulling its history back to
+`run.history_from` (2020-01-01 by default) and any announced future events,
+without waiting for the next scheduled or on-visit refresh. The status bar
+shows this running the same way a full refresh does. A company you add this
+way is permanent: it stays in the roster — and in every filter, search and
+country/sub-sector list — until you remove it, across restarts and page
+refreshes alike, because it's written straight into `companies.yaml`.
+
+If the country you type is `US` (or `United States`), a `sec_edgar` source is
+added automatically even without a CIK — see **SEC CIK auto-resolution**
+under *Source types* below.
 
 That panel is a thin front end over `companies.yaml` — it edits the same file
 you'd edit by hand, as text, so the comments at the top of that file survive
@@ -135,6 +154,27 @@ you with a broken roster.
 *(This needs `python -m tracker serve` running. A static `out/dashboard.html`
 opened directly can't write to your files — press the button there and it'll
 tell you the one command to run.)*
+
+### Bulk-importing a roster spreadsheet
+
+If you're starting from a spreadsheet rather than adding companies one at a
+time — one sheet per market, a bold row marking the start of each sub-sector,
+then Company Name / Ticker rows below it (Bloomberg-style tickers like
+`2330 TT Equity`) — `import_excel_companies.py` reads the whole thing in:
+
+```bash
+pip install openpyxl          # only this script needs it
+python import_excel_companies.py "Company_Name_Tickers_and_Sub_Categories.xlsx"
+```
+
+It derives a ticker per market (`2330.TT Equity` → `2330.TW`, `700 HK Equity`
+→ `0700.HK`, `AAPL US Equity` → `AAPL`, and so on), tracks the sheet name as
+`country` and the bold header as `sub_sector`, and gives every company a
+`news` source plus, for the US sheet, a `sec_edgar` source with no CIK (see
+below). **A company already in `companies.yaml` is never overwritten** — only
+its `country` and `sub_sector` are filled in or corrected, so a hand-tuned
+entry with a real RSS feed or CIK keeps it. Re-run it any time the sheet
+changes; it's safe to run repeatedly.
 
 ### If you'd rather script it
 
@@ -179,6 +219,22 @@ the three methods, `python -m tracker verify` confirms every URL responds.
 | `sec_edgar` | pulls filings from SEC EDGAR by CIK | any US-listed issuer |
 | `news` | queries a news index, then drops anything not whitelisted | corroboration |
 
+#### SEC CIK auto-resolution
+
+A `sec_edgar` source doesn't need a `cik:` line any more:
+
+```yaml
+      - type: sec_edgar
+        tier: regulatory
+```
+
+Left blank like this, the CIK is resolved automatically from the company's
+ticker against SEC's own published `company_tickers.json`, cached once per
+run. A CIK you set explicitly always wins — this is purely for the common
+case (added through the panel, or bulk-imported) where you only ever knew
+the ticker. If a ticker can't be resolved (an ETF, a name SEC doesn't carry,
+a typo) that one source is silently skipped rather than failing the run.
+
 ### Source tiers
 
 Tier drives the coloured rail down the left edge of each card, and decides
@@ -189,6 +245,32 @@ first.
 ---
 
 ## Reading the page
+
+### Summary boxes
+
+Six numbers across the top, always over the *whole* tracked set — they don't
+move when you change filters below, so they stay a stable at-a-glance read:
+
+| box | counts |
+|---|---|
+| New | events with status `new` — first seen since the last refresh |
+| Date Moved | events whose scheduled date shifted |
+| Revised | events whose headline, summary or category changed |
+| Upcoming (7d) | dated events from today through 7 days out, inclusive |
+| Upcoming (31d) | dated events from today through 31 days out, inclusive |
+| Tracked | companies currently in the roster |
+
+### Filters
+
+**Events Category** (the row of chips) is what used to just be "Category" —
+same thing, one per taxonomy entry in `config.yaml`, click to toggle. **Country**
+filters by market — Korea / Japan / China / Taiwan / Hong Kong / US / Europe,
+the same split as the sheets in a bulk-imported roster, not by individual
+stock exchange. **Sub-sector** filters by the GICS-style sectors from that
+same roster (Information Technology, Consumer Staples, Health Care, …). Both
+populate themselves from whatever's actually in `companies.yaml`, so a
+company you add with a new country or sub-sector value shows up as a new
+filter option immediately.
 
 ### Next 7 days
 
@@ -370,6 +452,7 @@ python -m tracker run --no-news      official sources only
 python -m tracker render             rebuild the static page without fetching
 python -m tracker list               show the roster
 python verified_seed.py              load 4 hand-verified real events, no network needed
+python import_excel_companies.py F   bulk-import a roster spreadsheet (needs: pip install openpyxl)
 ```
 
 ---
@@ -400,20 +483,65 @@ exists.
 announcement lists client-side, so `requests` sees an empty shell. For those, use
 the exchange filing feed instead (HKEXnews, SGX, TDnet, MOPS) or add Playwright.
 
-**History only goes back as far as you've been running it.** `history_from:
-2026-01-01` sets the window the page displays, but the tracker can only show what
-it has collected. RSS feeds typically carry 20–50 recent items and SEC EDGAR goes
-back years, so your first run will backfill a decent chunk of 2026 — but not
-evenly, and not everything. The archive fills in properly from the day you start
-running it daily. Right now the database holds exactly 4 events — the ones in
-`verified_seed.py` — because that's what could be individually confirmed real
-from this environment. Your first `python -m tracker run` against live sources
-replaces that with your actual coverage.
+**History only goes back as far as your sources reach.** `history_from:
+2020-01-01` sets the window the page *displays*, but the tracker can only show
+what it has actually collected: SEC EDGAR genuinely reaches back to 2020 (the
+workhorse for the ~1,245 US names, once each one's CIK auto-resolves — see
+above), RSS feeds typically carry 20–50 recent items regardless of the date on
+them, and a plain `news` source (what most of the ~1,700 non-US, bulk-imported
+names have, since a spreadsheet ticker alone doesn't tell you a company's IR
+URL) only reaches back about 30 days. So: full 2020-onward history for most US
+names from the first real run; everyone else fills in from the day you start
+running the tracker daily, faster for any company you've given a real `rss` or
+`ir_page` source. Right now the database holds exactly the 4 events in
+`verified_seed.py` — hand-checked against their primary source, not scraped —
+because that's what could be individually confirmed real from this
+environment. Your first `python -m tracker run` (or the first `serve`
+auto-refresh) against live sources replaces that with your actual coverage.
 
-**Respect the sites.** There's a one-second-per-host delay built in. Don't remove
-it, and check each site's terms and `robots.txt` before adding it — some IR
-providers prohibit automated collection, and a licensed feed is the right answer
-for anything client-facing.
+**A roster in the thousands takes real time to fetch, by design, not by
+accident.** Sources are fetched on a bounded thread pool (`run.max_workers`),
+so different companies' different IR hosts run concurrently — but a handful of
+large public endpoints (SEC EDGAR, Google News) are shared by *every* company
+using them, and those requests still queue behind that host's own courtesy
+delay (`run.host_delay_overrides`). With ~2,900 companies mostly on a shared
+`news` source, one full pass takes on the order of 20 minutes; `max_run_seconds`
+is set high enough to usually finish that in one run, and if it doesn't,
+whatever's left is named in the run's notes and picked up next time — same
+graceful-skip behaviour as a small roster, just visible more often at this
+scale. None of this blocks the page itself; it's a background thread, and
+"Refresh now" starts it without waiting.
+
+**Parsing a roster this size costs something too — paid once, not per page
+view.** `companies.yaml` at ~2,900 entries takes real, measurable time
+(seconds, not milliseconds) to parse. `tracker serve` pays that cost once at
+startup ("Loading companies.yaml…" in the terminal) and again whenever the
+file's modified time changes — i.e. right after an add/pause/remove — and
+caches the result in between, so ordinary page views and filter changes stay
+instant. If you installed via `pip install -r requirements.txt`, PyYAML's
+compiled parser (when your platform's wheel includes it, which the common
+Windows/macOS wheels do) makes this faster still.
+
+**Respect the sites.** Small IR sites keep the full one-second-per-host delay.
+Don't remove it, and check each site's terms and `robots.txt` before adding
+one — some IR providers prohibit automated collection, and a licensed feed is
+the right answer for anything client-facing. The faster rates in
+`host_delay_overrides` are deliberately scoped to large public endpoints that
+publish their own higher limits (SEC EDGAR: up to 10 requests/second by their
+own fair-access guideline) — extend that list only for a host you've checked
+tolerates it.
+
+**Most non-US, bulk-imported companies only have a `news` source today.** A
+roster spreadsheet gives a ticker and a name, not an IR URL — so those
+companies are tracked (and searchable, and filterable) from the moment
+they're imported, but their event coverage is corroboration-only (whitelisted
+press, filtered by domain, same as everywhere else) until you give an
+individual company a real `rss` or `ir_page` source, which then also unlocks
+that company's own historical archive rather than just the last ~30 days.
+This is a real gap, not a rounding error — treat this roster as "everyone's on
+the list and searchable" more than "everyone has full regulatory-grade
+coverage," and add proper sources for whichever names you actually watch
+closely.
 
 **This is a monitoring aid, not a system of record.** Verify anything that goes
 into a model or a note against the primary document, which is exactly one click
