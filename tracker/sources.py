@@ -22,7 +22,7 @@ import requests
 from bs4 import BeautifulSoup
 from dateutil import parser as dateparser
 
-from .models import RawItem
+from .models import DATE_PHRASE_PATTERNS, RawItem
 
 _TIME_RE = re.compile(
     r"\b(\d{1,2}[:.]\d{2}\s?(?:am|pm|AM|PM)?)\s*"
@@ -109,20 +109,14 @@ def extract_event_datetime(text: str, fallback_date: Optional[str]):
     item's own publish date when the text doesn't name one — right for a
     same-day release, approximate for a forward calendar invite that
     happens to omit the date from its own headline."""
-    months = (r"January|February|March|April|May|June|July|August|"
-              r"September|October|November|December")
-    # Tried in order of specificity: ISO, "Month Day[, ]Year", the
-    # day-before-month order common outside the US ("12 November 2026"),
-    # then a bare "Month Day" with no year at all.
-    date_patterns = [
-        r"\b\d{4}-\d{2}-\d{2}\b",
-        rf"\b(?:{months})\s+\d{{1,2}}(?:st|nd|rd|th)?,?\s+20\d{{2}}\b",
-        rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:{months})\s+20\d{{2}}\b",
-        rf"\b(?:{months})\s+\d{{1,2}}(?:st|nd|rd|th)?\b",
-    ]
+    # Same pattern list event_id() uses to strip a date phrase out of a
+    # headline before hashing — kept in one place (models.py) so the two
+    # can't drift apart. Tried in order of specificity: ISO, "Month
+    # Day[, ]Year", the day-before-month order common outside the US
+    # ("12 November 2026"), then a bare "Month Day" with no year at all.
     event_date = None
-    for pattern in date_patterns:
-        m = re.search(pattern, text)
+    for pattern in DATE_PHRASE_PATTERNS:
+        m = pattern.search(text)
         if not m:
             continue
         try:

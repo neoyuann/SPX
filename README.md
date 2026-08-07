@@ -421,8 +421,12 @@ To go strictly first-party, run `python -m tracker run --no-news`, or set
 
 ## Change detection
 
-Each event gets a stable id from its canonical URL, and a content hash over the
-things a reader cares about — headline, category, dates, summary. On every run:
+Each event gets a stable id from its ticker, category, calendar year and a
+normalised slice of its headline (with any date phrase in that headline
+stripped out first) — deliberately *not* the exact date, and not the URL,
+because the exact date is precisely the thing that's allowed to change
+without becoming a different event. A content hash over the rest — headline,
+category, summary, time — catches everything else. On every run:
 
 | status | meaning |
 |---|---|
@@ -435,6 +439,29 @@ Every change is written to a `changes` table and shown as change history in the
 drawer, so you can see when something shifted and what it shifted from.
 **Changed only** and **New only** are the monitoring view; everything else is
 browsing.
+
+### Nothing is ever removed
+
+The database only ever inserts or updates an event — there is no code path
+that deletes one. If a company's RSS feed rolls an old item off, its news
+lookback window passes, an IR page gets redesigned, or a link that used to
+work now 404s, that event simply isn't touched on runs where it doesn't
+reappear — it stays exactly as last stored, at its last known status, with
+its full change history intact. It does **not** disappear from the page. The
+page always grows by addition and correction, never by silent removal;
+`Store.mark_unseen_as_stale` in `tracker/store.py` is a no-op that exists
+specifically to document this decision, so a future edit doesn't
+accidentally wire deletion in. `python -m tracker run --no-news` or a
+company you `Remove` from the roster are the only two ways an event stops
+being *fetched* — and removing a company only stops new events for it; its
+past events stay in the database (`Pause` keeps a company's events too;
+`Remove` does the same, it just also drops the company from future runs).
+
+When the same real-world event *does* reappear with a corrected date, that's
+handled as `date_moved` on the existing row rather than a second, duplicate
+event — including when the correction is embedded in the headline text
+itself ("...on 12 November 2026" → "...on 19 November 2026"), which is
+common for calendar-invite-style announcements.
 
 ---
 
