@@ -1,12 +1,16 @@
 """Local server.
 
 Serves the dashboard at http://127.0.0.1:<port>. Every visit rebuilds the page
-from the database, so you always see the latest stored data immediately — and
-if that data is stale, a re-scrape starts in the background and the page updates
-itself when it finishes. You never wait on a spinner.
-
-A daily run is scheduled from `refresh.daily_at` in config.yaml, so the tracker
-stays current even on days you don't open it.
+from the database and serves it immediately — visiting or refreshing the page
+never itself starts a scrape, so you never wait on one. Instead, `serve` keeps
+the data fresh on its own: a refresh cycle starts the moment this process
+launches, then again every `refresh.background_interval_minutes`, for as long
+as it keeps running, regardless of whether anyone is looking at the page. The
+practical upshot: start the tracker before you plan to check it (leave
+`START TRACKER (Windows).bat` open, or host `serve` somewhere always-on) and
+it's already current by the time you open the browser. **Refresh now** is
+still there for "I want the very latest, right now" — it forces an extra
+cycle on top of the background one, it doesn't replace it.
 
     python -m tracker serve
     python -m tracker serve --port 9000 --open
@@ -22,7 +26,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .pipeline import run as run_pipeline, load_yaml
-from .render import build_payload, page_html
+from .render import _to_sgt, build_payload, page_html
 from .store import Store
 
 
@@ -56,7 +60,7 @@ class RefreshManager:
         self.message = ""
         self.data_version = 0
         self.last_error = ""
-        self.next_daily = ""
+        self.next_background_run = ""
         self.last_finished = self._last_finished_from_db()
 
     # -- config is re-read every time so edits to companies.yaml take effect
@@ -76,21 +80,14 @@ class RefreshManager:
         except Exception:
             return ""
 
-    def is_stale(self) -> bool:
-        ref = self.cfg().get("refresh", {}) or {}
-        if not ref.get("on_visit", True):
-            return False
-        last = parse_utc(self.last_finished)
-        if last is None:
-            return True
-        mins = float(ref.get("min_interval_minutes", 30))
-        return _now() - last > timedelta(minutes=mins)
-
-    def maybe_refresh(self, force: bool = False) -> bool:
-        """Start a full refresh if one isn't already going. Returns True if started."""
+    def maybe_refresh(self, force: bool = True) -> bool:
+        """Start a full refresh if one isn't already going. Returns True if
+        started. `force` exists for the call shape, not as a real gate any
+        more — a visit never calls this (see do_GET), so the only callers
+        left are the background scheduler and the Refresh now button, both
+        of which always want one started regardless of how fresh the data
+        already looks."""
         if self.running:
-            return False
-        if not force and not self.is_stale():
             return False
         with self.lock:
             if self.running:
@@ -145,10 +142,10 @@ class RefreshManager:
 
     def status(self) -> dict:
         return {"running": self.running, "message": self.message,
-                "last_run": _iso(self.last_finished),
+                "last_run": _sgt(self.last_finished),
                 "data_version": self.data_version,
                 "error": self.last_error,
-                "next_daily": self.next_daily,
+                "next_background_run": self.next_background_run,
                 "history": self.history()}
 
     def history(self, limit: int = 20) -> list:
@@ -159,8 +156,8 @@ class RefreshManager:
         except Exception:
             return []
         for r in rows:
-            r["finished_at"] = _iso(r.get("finished_at"))
-            r["started_at"] = _iso(r.get("started_at"))
+            r["finished_at"] = _sgt(r.get("finished_at"))
+            r["started_at"] = _sgt(r.get("started_at"))
         return rows
 
     def payload(self) -> dict:
@@ -168,37 +165,43 @@ class RefreshManager:
         return {"events": events, "meta": meta, "version": self.data_version}
 
 
-def _iso(value):
-    """Always hand the page an unambiguous UTC timestamp; it renders SGT."""
+def _sgt(value):
+    """Every timestamp the page shows is Singapore time — stored as UTC,
+    converted here so the page never has to (it used to just label a raw
+    UTC value " SGT" without actually converting it, which was wrong by
+    exactly the UTC+8 offset)."""
     dt = parse_utc(value)
-    return dt.isoformat(timespec="seconds") if dt else ""
+    return _to_sgt(dt.isoformat()) if dt else ""
 
 
-def daily_scheduler(manager: RefreshManager):
-    """Fire a refresh once a day at refresh.daily_at."""
+def background_scheduler(manager: RefreshManager):
+    """Keeps the data current on its own, independent of anyone visiting —
+    that's the whole point: a page load never triggers a scrape (see
+    do_GET), so something has to. The first cycle starts the moment this
+    thread does (i.e. the moment `serve` launches), not at a fixed clock
+    time, so restarting the tracker doesn't mean waiting until tomorrow for
+    fresh data. After that it repeats every
+    `refresh.background_interval_minutes`, measured start-to-start: if a
+    cycle takes 20 minutes and the interval is 60, there's about 40 minutes
+    idle before the next one begins. A cycle that overruns the interval
+    just runs back-to-back into the next one, with a small floor so this
+    loop can never spin without pausing at all.
+    """
     while True:
-        ref = manager.cfg().get("refresh", {}) or {}
-        at = ref.get("daily_at")
-        if not at:
-            time.sleep(600)
-            continue
-        try:
-            hh, mm = [int(x) for x in str(at).split(":")[:2]]
-        except Exception:
-            print(f"[daily] can't read refresh.daily_at = {at!r}; expected HH:MM")
-            time.sleep(3600)
-            continue
-        now = datetime.now()
-        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        wait = (target - now).total_seconds()
-        manager.next_daily = target.isoformat(timespec="seconds")
-        print(f"[daily] next scheduled run {target:%Y-%m-%d %H:%M}")
-        time.sleep(wait)
-        print("[daily] starting scheduled refresh")
+        cycle_started = time.time()
         manager.maybe_refresh(force=True)
-        time.sleep(60)   # don't re-fire inside the same minute
+        while manager.running:
+            time.sleep(1)
+
+        ref = manager.cfg().get("refresh", {}) or {}
+        interval_minutes = float(ref.get("background_interval_minutes", 60))
+        elapsed = time.time() - cycle_started
+        wait = max(60.0, interval_minutes * 60 - elapsed)
+        target = _now() + timedelta(seconds=wait)
+        manager.next_background_run = _to_sgt(target.isoformat())
+        print(f"[background] refresh done, next one at {target:%Y-%m-%d %H:%M} UTC "
+              f"(in {wait/60:.0f} min)")
+        time.sleep(wait)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -221,14 +224,10 @@ class Handler(BaseHTTPRequestHandler):
         path = self.path.split("?")[0]
 
         if path in ("/", "/index.html"):
-            # A failure here must not blank the page, so anything unexpected
-            # from the staleness check is swallowed and logged.
-            # Kick off a background refresh if the data is stale, then serve
-            # what we have straight away. The page picks up the new data itself.
-            try:
-                m.maybe_refresh()
-            except Exception as exc:
-                print(f"[warn] couldn't start background refresh: {exc}")
+            # Deliberately does not trigger a scrape. Visiting or refreshing
+            # the page always just renders whatever's already in the
+            # database, instantly — keeping that current is background_
+            # scheduler's job, running independently of anyone looking.
             events, meta = build_payload(m.cfg(), m.roster())
             self._send(200, page_html(events, meta, live=True), "text/html; charset=utf-8")
 
@@ -361,7 +360,7 @@ def serve(config_path="config.yaml", companies_path="companies.yaml",
         or (cfg.get("refresh", {}) or {}).get("port", 8765)
     host = "0.0.0.0" if on_host else "127.0.0.1"
 
-    threading.Thread(target=daily_scheduler, args=(manager,), daemon=True).start()
+    threading.Thread(target=background_scheduler, args=(manager,), daemon=True).start()
 
     url = f"http://127.0.0.1:{port}"
     server = ThreadingHTTPServer((host, port), Handler)
@@ -369,8 +368,8 @@ def serve(config_path="config.yaml", companies_path="companies.yaml",
         print(f"Corporate event monitor listening on {host}:{port}")
     else:
         print(f"Corporate event monitor running at {url}")
-    print("Every visit rebuilds the page from the database and refreshes stale "
-          "sources in the background.")
+    print("Every visit rebuilds the page from the database instantly — refreshing "
+          "runs in the background, on its own schedule, whether or not anyone's looking.")
     print("Ctrl+C to stop.")
     if open_browser and not on_host:
         threading.Timer(0.8, lambda: webbrowser.open(url)).start()

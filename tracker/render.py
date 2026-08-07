@@ -312,7 +312,7 @@ def page_html(events: list, meta: dict, live: bool = True) -> str:
 <div class="modal-panel" id="historyPanel">
   <button class="drawer-close" id="historyClose">&times;</button>
   <h2>Refresh history</h2>
-  <table class="hist-table"><thead><tr><th>Finished</th><th>New</th><th>Changed</th><th>Companies</th><th>Notes</th></tr></thead>
+  <table class="hist-table"><thead><tr><th>Finished (SGT)</th><th>New</th><th>Changed</th><th>Companies</th><th>Notes</th></tr></thead>
   <tbody id="historyBody"></tbody></table>
 </div>
 
@@ -656,7 +656,10 @@ function pollLoop(){
   fetch('/api/status').then(r=>r.json()).then(s=>{
     if(s.running){ setStatus((s.message||'Refreshing…'), 'running'); setTimeout(pollLoop, 1200); return; }
     if(s.error){ setStatus('Error: ' + s.error, 'error'); }
-    else { setStatus('Last refreshed ' + (s.last_run||'—') + ' SGT', ''); }
+    else {
+      const next = s.next_background_run ? ` · next automatic refresh ${s.next_background_run} SGT` : '';
+      setStatus(`Last refreshed ${s.last_run||'—'} SGT${next}`, '');
+    }
     if(lastVersion !== null && s.data_version !== lastVersion){
       fetch('/api/data').then(r=>r.json()).then(d=>{
         EVENTS.length=0; EVENTS.push(...d.events);

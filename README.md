@@ -51,17 +51,33 @@ see **Sharing this with someone who won't install anything** below.
 
 ## How refreshing works
 
-**Every visit rebuilds the page from the database.** Instantly. Whatever the
-tracker knows, you see — including anything the overnight run picked up.
+**Every visit rebuilds the page from the database and serves it instantly.**
+Visiting the page, or hitting your browser's refresh button, never itself
+starts a scrape — you're never waiting on one just because you opened a tab.
+What you see is whatever the tracker already knows, which — as long as
+`serve` has been running for a while — is current, because of the next part:
 
-**Every visit also starts a scrape if the data is stale** — older than
-`refresh.min_interval_minutes` (default 30). It runs in the background and the
-page updates itself when it finishes, without a reload and **without losing
-your filters**. Set the threshold to `0` for a scrape on literally every visit.
+**The tracker refreshes itself continuously in the background, on its own,
+whether or not anyone's looking.** The first cycle starts the moment `serve`
+launches, not at a fixed time of day, and it repeats every
+`refresh.background_interval_minutes` (default 60) for as long as the process
+keeps running. So: start the tracker *before* you plan to check it — leave
+`START TRACKER (Windows).bat` open, or host `serve` somewhere always-on (see
+**Sharing this online** below) — and by the time you open the browser, it's
+already been keeping itself up to date. A roster this size (~2,900 companies)
+takes roughly 20 minutes for one full cycle; with the default 60-minute
+interval that's about 40 minutes idle between cycles, so data is never more
+than about an hour old if the server's been running that whole time.
 
-**Refresh now** forces a run regardless of the threshold. While it works, the
-bar shows live progress per source — `Refreshing… 15 of 23 sources · 1810.HK ·
-ir_page` — so you can see it moving, not just guess that it hasn't hung.
+**Refresh now** forces an *extra* cycle immediately, on top of the background
+one — useful for "I want the very latest, right now," not something you need
+to press just to see data at all. While a cycle runs (background-triggered or
+button-triggered — the bar looks the same either way, since a page visit
+never knows or cares which one is running), the bar shows live progress per
+source — `54 of 4142 sources · 006800.KS · news` — so you can see it moving,
+not just guess that it hasn't hung. Once idle, the bar shows both when it last
+finished and when the next background cycle is due: `Last refreshed
+2026-08-07 14:52 SGT · next automatic refresh 2026-08-07 15:52 SGT`.
 
 ### If refresh wasn't completing for you
 
@@ -96,24 +112,31 @@ If a refresh still doesn't complete for you, the terminal running
 way to tell whether it's a specific site or something environmental (a
 firewall, a proxy, a VPN) blocking outbound requests.
 
-**A daily run fires at `refresh.daily_at`** (default 07:00) as long as `serve`
-is up. **Refresh history**, linked in the bar, shows every completed run.
-**All times on the page are Singapore time**, labelled `SGT` — stored in UTC
-and converted for display. The one exception is an event's own start time,
-reproduced exactly as the company stated it, in the company's own timezone.
+**Refresh history**, linked in the bar, shows every completed run — background
+and manual alike, there's no separate log for each. **All times on the page
+are Singapore time**, labelled `SGT` — stored in UTC and converted for
+display. The one exception is an event's own start time, reproduced exactly
+as the company stated it, in the company's own timezone.
 
 ### Keeping it running
 
-`serve` needs to be running for any of this. Start it once and leave it — it
-idles at essentially zero cost. Easiest is just leaving the
-`START TRACKER (Windows).bat` window open. To have it start automatically:
-Task Scheduler → new task → trigger *At log on* → action `python -m tracker
-serve`, start-in set to the project folder.
+`serve` needs to be running for the background refresh to happen at all —
+this matters more than it used to, now that visiting the page doesn't trigger
+one itself. Start it once and leave it; it idles at essentially zero cost
+between cycles. Easiest is just leaving the `START TRACKER (Windows).bat`
+window open. To have it start automatically: Task Scheduler → new task →
+trigger *At log on* → action `python -m tracker serve`, start-in set to the
+project folder. For an always-current page with nobody needing to keep a
+laptop on, host `serve` somewhere always-on instead — see **Sharing this
+online** below; the free tiers of the usual hosts sleep when idle, which
+fights this model directly (see the callout there).
 
 If you'd rather not run a server, `python -m tracker run` does a one-off fetch
-and writes a static `out/dashboard.html`. You lose refresh-on-visit and the
-company-management panel that way — the page tells you so if you open a static
-copy — but the data itself is identical either way.
+and writes a static `out/dashboard.html`. You lose the continuous background
+refresh and the company-management panel that way — the page tells you so if
+you open a static copy — but the data itself is identical either way, and
+`import_excel_companies.py` / `python -m tracker add` still work against
+`companies.yaml` regardless of whether `serve` is running.
 
 ---
 
@@ -356,11 +379,13 @@ live Python process behind it, which a static Pages site doesn't have. Add
 companies by editing `companies.yaml` and pushing, same as any other change to
 the repo; the next scheduled run picks it up.
 
-### A live link, refresh-on-visit and the company panel included
+### A live link, continuously self-refreshing, company panel included
 
 For that you need `tracker serve` reachable from outside your machine, which
-means running it somewhere other than your laptop. Any small always-on host
-works — [Render](https://render.com), [Railway](https://railway.app), or
+means running it somewhere other than your laptop, **and it needs to actually
+keep running** — the background refresh (see **How refreshing works** above)
+only happens while the process is alive, same as locally. Any small always-on
+host works — [Render](https://render.com), [Railway](https://railway.app), or
 [Fly.io](https://fly.io) all have tiers that comfortably fit this. In broad
 strokes: connect the repo, set the start command to
 `python -m tracker serve --port $PORT`, and set `refresh.port` to read from
@@ -368,10 +393,20 @@ the `PORT` environment variable the host provides. Exact steps vary by
 provider — their own quickstarts for "deploy a Python web app" apply directly,
 since this is just a small `http.server` app with no framework dependency.
 
+**Free tiers that sleep the service when idle fight this model directly.**
+Render's free plan, for one, suspends the process after ~15 minutes with no
+inbound requests — which kills the background-refresh thread along with it,
+and a full cycle over this roster takes roughly 20 minutes, longer than that
+sleep window, so it may never finish one uninterrupted pass without a visitor
+keeping it awake. A paid "no sleep" tier (Render's Starter plan, roughly
+$7/month, is the cheapest one that qualifies) is the straightforward fix if
+you want the hosted copy to actually stay current the way it's designed to;
+otherwise expect it to only make partial progress between naps.
+
 Either path is a legitimate answer to "shareable link." Pick the daily one if
-what matters is that anyone can open it with zero setup; pick the hosted one
-if what matters is that it behaves exactly like your local copy, refresh
-button and all.
+what matters is that anyone can open it with zero setup; pick the always-on
+hosted one if what matters is that it behaves exactly like your local copy,
+continuously refreshing itself and all.
 
 ---
 

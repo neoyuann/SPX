@@ -61,17 +61,26 @@ output:
 # -----------------------------------------------------------------------------
 # REFRESH
 # `python -m tracker serve` runs a local server that rebuilds the page from the
-# database on every visit and re-scrapes sources in the background.
+# database on every visit, instantly — visiting or refreshing the page never
+# itself starts a scrape. Instead the tracker refreshes itself continuously in
+# the background, on background_interval_minutes below, for as long as `serve`
+# keeps running — the first cycle starts the moment the process launches, not
+# at a fixed clock time. So: start the tracker before you plan to check it
+# (leave the launcher window open, or host `serve` somewhere always-on) and
+# the page is already current by the time you open it, no waiting involved.
+# "Refresh now" still forces an extra cycle on demand, it just isn't the
+# only thing keeping the data fresh any more.
 # -----------------------------------------------------------------------------
 refresh:
   port: 8765
-  on_visit: true
-  # Re-scrape on a visit only if the data is older than this. Not zero on
-  # purpose: a full run takes minutes and touches every IR site, so opening
-  # five tabs shouldn't fire five scrapes. "Refresh now" forces one regardless.
-  min_interval_minutes: 30
-  # Scheduled daily run, 24-hour local time. Set to null to turn it off.
-  daily_at: "07:00"
+  # Time between the START of one background cycle and the start of the
+  # next. A full pass over ~2,900 companies takes roughly 20 minutes (see
+  # run.max_run_seconds), so with the default 60 there's about 40 minutes
+  # idle between cycles — a smaller roster finishes its cycle in seconds,
+  # so effectively refreshes every 60 minutes on the dot. Lower this if you
+  # want fresher data and don't mind the extra load on the sources; there's
+  # a 60-second floor regardless, so this can't be set to spin continuously.
+  background_interval_minutes: 60
 
 # -----------------------------------------------------------------------------
 # NEWS WHITELIST
