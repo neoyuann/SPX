@@ -44,16 +44,30 @@ run:
   # Classifying, grouping, link-checking and storing whatever was actually
   # fetched always runs to completion regardless of this number; only
   # fetching stops once it's hit, and whichever companies didn't get
-  # fetched are named in the run's notes and picked up next time. (An
-  # earlier version gated the whole run behind this, so a fetch phase that
-  # ran long on real-world network latency could silently discard
-  # everything it had already gathered — fixed; see pipeline.py's module
-  # docstring.) With a roster of ~2,900 companies nearly all sharing the
-  # same news.google.com host (rate-limited by host_delay_overrides above),
-  # a full fetch pass takes roughly 20 minutes; 1800s gives that headroom.
-  # It's a background thread either way — the page stays responsive
-  # regardless of how long this runs.
-  max_run_seconds: 1800
+  # fetched this cycle are named in the run's notes and get first priority
+  # next time (fetch order is shuffled every run specifically so a
+  # time-limited cycle doesn't stall on the same prefix of companies.yaml
+  # forever — coverage of the whole roster converges over many cycles even
+  # when no single cycle finishes everything). (An earlier version gated
+  # the *whole run* behind this number, so a fetch phase that ran long on
+  # real-world network latency could silently discard everything it had
+  # already gathered — fixed; see pipeline.py's module docstring.)
+  #
+  # Kept well under 15 minutes on purpose: Render's free tier (the
+  # zero-cost hosting option this project's README recommends first) sleeps
+  # the whole process after ~15 minutes with no incoming requests, which
+  # kills an in-progress cycle and — because that tier's disk is also
+  # ephemeral — throws away everything gathered since the last successful
+  # write. 600s leaves headroom for the (usually much faster, but
+  # unbounded) link-check-and-store phase to also finish inside that
+  # window, as long as something (a visitor's browser polling
+  # /api/status, or you keeping a tab open) keeps the service registering
+  # as active the whole time. Self-hosting locally, or on a host with a
+  # persistent disk and no auto-sleep, has none of these constraints —
+  # raise this freely (a full pass over ~2,900 companies takes roughly 20
+  # minutes end-to-end at 1800s, mostly rate-limited behind
+  # news.google.com — see host_delay_overrides above).
+  max_run_seconds: 600
   user_agent: "CorporateEventTracker/1.0 (research use; contact: you@example.com)"
   # ^ SEC EDGAR requires a real contact address in the User-Agent. Put yours in.
 
@@ -79,12 +93,14 @@ output:
 refresh:
   port: 8765
   # Time between the START of one background cycle and the start of the
-  # next. A full pass over ~2,900 companies takes roughly 20 minutes (see
-  # run.max_run_seconds), so with the default 60 there's about 40 minutes
-  # idle between cycles — a smaller roster finishes its cycle in seconds,
-  # so effectively refreshes every 60 minutes on the dot. Lower this if you
-  # want fresher data and don't mind the extra load on the sources; there's
-  # a 60-second floor regardless, so this can't be set to spin continuously.
+  # next. With the default run.max_run_seconds (600s) a large roster's
+  # fetch phase is capped at 10 minutes, plus however long link-checking
+  # takes on top (usually a few more, see run.max_run_seconds) — comfortably
+  # inside the default 60-minute interval, leaving idle time between
+  # cycles. A smaller roster finishes in seconds and effectively refreshes
+  # every 60 minutes on the dot. Lower this if you want fresher data and
+  # don't mind the extra load on the sources; there's a 60-second floor
+  # regardless, so this can't be set to spin continuously.
   background_interval_minutes: 60
 
 # -----------------------------------------------------------------------------

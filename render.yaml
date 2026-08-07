@@ -1,13 +1,42 @@
 # Render reads this file automatically and configures the service, so you
 # don't have to fill in build/start commands by hand.
 #
-# Free tier notes, so nothing surprises you:
-#   - The service sleeps after ~15 minutes with no visitors. The next visit
-#     wakes it, which takes 30-60 seconds. After that it's fast again.
-#   - The filesystem resets whenever the service restarts or redeploys. That
-#     means companies you add through the website are kept while it's awake,
-#     but revert to whatever is in this repo after a restart. To make a
-#     company permanent, add it here too (see SHARE THIS ONLINE.txt).
+# THE FREE TIER FIGHTS THIS APP'S DESIGN — READ THIS FIRST.
+# ------------------------------------------------------------------------
+# `serve` keeps its data (tracked companies you added through the panel,
+# every event it's ever scraped, full change history) on disk, and refreshes
+# itself continuously in the background for as long as the process is alive
+# — see README.md's "How refreshing works". Render's free plan works against
+# both halves of that:
+#   - The service sleeps after ~15 minutes with no incoming requests, which
+#     kills a refresh cycle mid-flight (a roster of any real size takes
+#     longer than 15 minutes for one full pass — see config.yaml's
+#     run.max_run_seconds for the actual numbers and mitigations).
+#   - The filesystem is ephemeral: every restart or redeploy — including
+#     waking back up from a sleep — resets it to exactly what's committed
+#     to this repo. Companies added through the panel, and every event
+#     ever scraped, are gone on the next wake. Only what's checked into
+#     `companies.yaml` and `data/events.db` in git survives.
+# In practice, on the free tier: leave the tab open (its own status polling
+# counts as activity and helps prevent sleep) for one full cycle so it can
+# finish once, understanding it likely reverts on the next restart. That's
+# a real, workable way to see it work — not a way to keep the results.
+#
+# TO ACTUALLY KEEP DATA PERSISTENT AND REFRESH UNINTERRUPTED, either:
+#   1. Run it locally instead (`START TRACKER (Windows).bat`) — free, no
+#      sleep, no ephemeral disk, works today with nothing below changed.
+#   2. Upgrade this service to a paid plan with a persistent disk. Change
+#      `plan: free` to `plan: starter` below (Render's cheapest plan with
+#      both no-sleep and disk support, roughly $7/month at time of writing
+#      — confirm current pricing on Render), then uncomment the `disk:`
+#      block. The mountPath must match run.output.db_path's directory in
+#      config.yaml (default "data/"), resolved from the repo root:
+#
+#   plan: starter
+#   disk:
+#     name: tracker-data
+#     mountPath: /opt/render/project/src/data
+#     sizeGB: 1
 
 services:
   - type: web

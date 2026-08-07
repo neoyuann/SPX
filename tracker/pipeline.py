@@ -23,9 +23,10 @@ from __future__ import annotations
 
 import difflib
 import os
+import random
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 
 import yaml
 
@@ -161,8 +162,19 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
     max_workers = max(1, int(cfg.get("run", {}).get("max_workers", 8)))
     started = time.time()
 
+    # Shuffled, not roster order — a run that hits its time budget partway
+    # through (routine on a large roster, especially on a host that also
+    # has its own tighter time constraints, like a free tier that sleeps
+    # the process after ~15 minutes idle) would otherwise stall on the same
+    # prefix of companies.yaml every single cycle, forever, and never reach
+    # anything past it. A different random subset gets covered each time
+    # instead, so coverage of the whole roster still converges over many
+    # cycles even when no single cycle finishes everything.
+    shuffled_companies = companies[:]
+    random.shuffle(shuffled_companies)
+
     all_sources = []
-    for c in companies:
+    for c in shuffled_companies:
         for s in c.get("sources", []):
             if s.get("type") == "news" and not news_enabled:
                 continue
@@ -191,16 +203,24 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
             return c, s, fetcher(s, c, cfg, session, allowed_domains)
         return c, s, fetcher(s, c, cfg, session)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = {}
-        for c, s in all_sources:
-            if time.time() - started > max_run_seconds:
-                out_of_time = True
-                skipped_companies.append(c["ticker"])
-                continue
-            futures[pool.submit(fetch_one, c, s)] = (c, s)
-
-        for future in as_completed(futures):
+    # Submitting is cheap regardless of count — even 4,000+ calls to
+    # pool.submit() finish in milliseconds — so a budget check gating only
+    # *submission* never actually has a chance to fire before everything's
+    # already queued. The real bound has to be on *waiting*: as_completed's
+    # own timeout, catching the TimeoutError it raises once the deadline
+    # passes with futures still outstanding. (Confirmed with a standalone
+    # repro: a 0.5s budget submitted 20 slow tasks in under 1ms, then the
+    # process waited the full 6 seconds for all of them regardless — this
+    # loop used to have exactly that shape.) Explicit pool lifecycle
+    # management, not `with`, because `with`'s implicit exit calls
+    # shutdown(wait=True) unconditionally — which would silently reintroduce
+    # the same unbounded wait right after catching the timeout.
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    futures = {pool.submit(fetch_one, c, s): (c, s) for c, s in all_sources}
+    try:
+        deadline_remaining = max(0.0, started + max_run_seconds - time.time())
+        completed_iter = as_completed(futures, timeout=deadline_remaining) if futures else iter(())
+        for future in completed_iter:
             c, s = futures[future]
             label = f"{c['ticker']} · {s['type']}"
             with progress_lock:
@@ -221,6 +241,18 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
             classified = [ci for item in items if (ci := classifier.classify(item)) is not None]
             with progress_lock:
                 classified_items.extend(classified)
+    except TimeoutError:
+        out_of_time = True
+        for future, (c, _s) in futures.items():
+            if not future.done():
+                skipped_companies.append(c["ticker"])
+        # Don't wait for whatever's still running — their own request_timeout
+        # bounds how much longer that can be, and a background refresh
+        # cycle running a bit long in the background is a fine trade for
+        # actually respecting the budget on the common path.
+        pool.shutdown(wait=False, cancel_futures=True)
+    else:
+        pool.shutdown(wait=True)
 
     if out_of_time:
         with progress_lock:
