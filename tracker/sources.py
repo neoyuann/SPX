@@ -101,10 +101,47 @@ def make_session(user_agent: str) -> requests.Session:
     return s
 
 
+class ResponseTooSlow(requests.exceptions.Timeout):
+    """Raised when a response's *total* download time exceeds
+    max_response_seconds, even though no single gap between chunks was
+    ever long enough to trip requests' own per-read socket timeout.
+
+    That gap-only guarantee is a real trap: `timeout=(connect, read)`
+    bounds the pause between successive reads, not how long the whole
+    body takes to arrive — a server that trickles bytes down just fast
+    enough to keep resetting that per-chunk clock can hold a connection
+    open indefinitely without ever raising anything. Because
+    ThreadPoolExecutor's worker threads are non-daemon, one thread stuck
+    that way blocks the whole process from exiting no matter what
+    pipeline.py's run-level deadline does — this is what turned a
+    ~25-minute GitHub Actions budget into a 5-hour hang before it was
+    caught. Streaming with our own wall-clock check closes that gap.
+    """
+
+
 def _get(session: requests.Session, url: str, cfg: dict, **kw):
-    timeout = tuple(cfg.get("run", {}).get("request_timeout", [6, 15]))
+    run_cfg = cfg.get("run", {}) or {}
+    timeout = tuple(run_cfg.get("request_timeout", [6, 15]))
+    max_total = float(run_cfg.get("max_response_seconds", 60))
     _be_polite(url, cfg)
-    return session.get(url, timeout=timeout, **kw)
+    r = session.get(url, timeout=timeout, stream=True, **kw)
+    deadline = time.monotonic() + max_total
+    chunks = []
+    try:
+        for chunk in r.iter_content(chunk_size=65536):
+            if chunk:
+                chunks.append(chunk)
+            if time.monotonic() > deadline:
+                raise ResponseTooSlow(
+                    f"{url} took longer than {max_total:.0f}s to fully download")
+    finally:
+        r.close()
+    # iter_content() consumed the stream ourselves, so requests never got a
+    # chance to populate r._content — do that manually so callers' usual
+    # r.json() / r.text / r.content keep working unchanged.
+    r._content = b"".join(chunks)
+    r._content_consumed = True
+    return r
 
 
 def link_is_alive(session: requests.Session, url: str, cfg: dict) -> bool:
@@ -123,7 +160,7 @@ def link_is_alive(session: requests.Session, url: str, cfg: dict) -> bool:
             r.close()
             return r.status_code < 400
         return False
-    except (requests.RequestException, PolitenessQueueBacklogged):
+    except (requests.RequestException, PolitenessQueueBacklogged, ResponseTooSlow):
         return False
 
 

@@ -21,6 +21,21 @@ run:
   # (connect, read) seconds. A slow or silently-dropping host fails fast on
   # the connect leg rather than eating its full timeout twice.
   request_timeout: [6, 15]
+  # Ceiling on how long a single response is allowed to take to fully
+  # download, wall-clock. This is NOT the same guarantee as request_timeout
+  # above: that tuple only bounds the *gap* between successive socket reads,
+  # not the total transfer — a server that trickles bytes down just fast
+  # enough to keep resetting that per-chunk clock can hold a connection open
+  # indefinitely without ever tripping it. _get() streams the body itself and
+  # checks this deadline against real elapsed time as chunks arrive, so no
+  # single fetch (the SEC ticker-list download in particular, which every
+  # US company's CIK auto-resolve funnels through behind one shared lock) can
+  # hang past this no matter how it trickles. Matters even with max_run_seconds
+  # and max_polite_wait_seconds both in place: ThreadPoolExecutor's worker
+  # threads aren't daemon threads, so one thread stuck inside a single
+  # response read — not waiting in the politeness queue, already past that
+  # and mid-download — still blocks the whole process from exiting.
+  max_response_seconds: 60
   polite_delay_seconds: 1.0   # pause between requests to the same host
   # A handful of large public endpoints (SEC EDGAR, Google News) are shared
   # by every company using them, so the plain per-host delay above would
