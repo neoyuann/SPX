@@ -23,7 +23,11 @@ on:
     - cron: "0 23 * * *"   # 07:00 SGT
   workflow_dispatch: {}
   push:
-    branches: [main]
+    # Whichever branch is actually this repo's default — Settings → General
+    # → "Default branch" shows/changes it. schedule and workflow_dispatch
+    # below don't depend on this list at all; they always run against
+    # whatever the default branch is, named "main" or not.
+    branches: [main, claude/company-events-scraper-hkxds4]
 
 permissions:
   contents: write   # needed to commit data/events.db back to the repo
