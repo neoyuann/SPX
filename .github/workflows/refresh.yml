@@ -1,5 +1,23 @@
 name: Refresh and publish to GitHub Pages
 
+# Runs the tracker on GitHub's own servers on a schedule and publishes a
+# static snapshot to GitHub Pages — a genuinely free, always-available
+# alternative to hosting `tracker serve` somewhere, with none of a paid-
+# tier-required host's sleep-on-idle or ephemeral-disk problems (see
+# render.yaml if you're weighing that against this). The trade-off: no
+# "Refresh now" button and no live company-management panel, since there's
+# no server behind this, only a page rebuilt on a schedule — add companies
+# by editing companies.yaml (or running import_excel_companies.py locally)
+# and pushing, same as any other change.
+#
+# Unlike a naive "fetch and publish" job, this one also commits data/events.db
+# back to the repo after every run (the "Persist accumulated data" step
+# below) — without that, every run would start over from whatever's already
+# committed and never accumulate history, which defeats the whole point.
+# Combined with pipeline.py's shuffled fetch order, coverage of a large
+# roster grows across scheduled runs even though any single run is time-
+# boxed (TRACKER_MAX_RUN_SECONDS below) well under this job's own limits.
+
 on:
   schedule:
     - cron: "0 23 * * *"   # 07:00 SGT
@@ -8,7 +26,7 @@ on:
     branches: [main]
 
 permissions:
-  contents: read
+  contents: write   # needed to commit data/events.db back to the repo
   pages: write
   id-token: write
 
@@ -31,7 +49,25 @@ jobs:
       - name: Fetch every source and build the static page
         env:
           SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
+          # A scheduled Actions job doesn't have Render-style 15-minute
+          # sleep-on-idle to worry about, so it can afford a much bigger
+          # fetch budget than the interactive-host default in config.yaml
+          # (600s) — comfortably covering a full pass over a large roster
+          # in one run instead of needing several days of partial ones.
+          TRACKER_MAX_RUN_SECONDS: "1500"
         run: python -m tracker run
+
+      - name: Persist accumulated data
+        run: |
+          if git diff --quiet -- data/events.db; then
+            echo "No changes to data/events.db this run."
+          else
+            git config user.name "github-actions[bot]"
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git add data/events.db
+            git commit -m "Scheduled refresh: update tracked events [skip ci]"
+            git push
+          fi
 
       - name: Prepare Pages artifact
         run: |

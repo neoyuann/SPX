@@ -159,6 +159,13 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
 
     news_enabled = (cfg.get("news", {}) or {}).get("enabled", True) and not no_news
     max_run_seconds = float(cfg.get("run", {}).get("max_run_seconds", 240))
+    env_budget = os.environ.get("TRACKER_MAX_RUN_SECONDS")
+    if env_budget:
+        # Lets a one-shot CI run (GitHub Actions, no 15-minute sleep timer
+        # to worry about) use a more generous budget than the shared
+        # config.yaml value — tuned for interactive hosts — without editing
+        # that file.
+        max_run_seconds = float(env_budget)
     max_workers = max(1, int(cfg.get("run", {}).get("max_workers", 8)))
     started = time.time()
 

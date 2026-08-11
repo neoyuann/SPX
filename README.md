@@ -355,16 +355,23 @@ dates, match reasoning and change history. Links open at the publisher.
 
 ## Sharing this with someone who won't install anything
 
-`tracker serve` runs on your machine and only your machine can reach it — that
-was never going to be a public link. Two ways to actually get one, with a real
-trade-off between them.
+`tracker serve` on your own machine only your machine can reach — that's
+local, not a public link. There are two fundamentally different shapes a
+public link can take, and which one fits depends on what you actually need
+from it.
 
-### A daily-refreshed link, zero install for anyone who opens it
+### GitHub Pages — genuinely free, no sleep, no ephemeral disk, the default recommendation
 
-`.github/workflows/refresh.yml` is included and ready to go. It runs the
-tracker on GitHub's own servers once a day and publishes the result to GitHub
-Pages — a URL like `https://you.github.io/your-repo/` that works for anyone,
-on any device, with nothing installed. Setup:
+`.github/workflows/refresh.yml` runs the tracker on GitHub's own servers on a
+schedule and publishes a static snapshot to Pages — a URL like
+`https://you.github.io/your-repo/` that works for anyone, on any device, with
+nothing installed, and **actually costs nothing regardless of traffic** (for
+a public repo, Actions minutes are unlimited; a private repo gets 2,000
+free minutes/month, and one run a day at this project's scale uses a small
+fraction of that). Unlike a service that has to stay running, there's no
+sleep-on-idle to fight — each run just does its job and exits.
+
+Setup:
 
 1. Push this folder to a GitHub repository.
 2. Repo **Settings → Pages → Build and deployment → Source: "GitHub Actions"**.
@@ -373,40 +380,77 @@ on any device, with nothing installed. Setup:
 4. Push to `main`, or use the **Run workflow** button under the **Actions**
    tab to trigger it right away instead of waiting for the schedule.
 
-The trade-off: this copy refreshes daily, not the instant someone opens it,
-and it doesn't have the **+ Add / remove companies** panel — that needs a
-live Python process behind it, which a static Pages site doesn't have. Add
-companies by editing `companies.yaml` and pushing, same as any other change to
-the repo; the next scheduled run picks it up.
+**It accumulates real history across runs, not just whatever one run finds.**
+The workflow commits `data/events.db` back to the repo after every run (see
+the "Persist accumulated data" step), so the next scheduled run continues
+from where the last one left off instead of starting over from the 4 seed
+events every time — the same never-delete, only-add-or-update database this
+whole project is built around, just persisted via git commits instead of a
+long-lived disk. Combined with the shuffled fetch order (see **Things worth
+knowing**), coverage of a large roster grows across scheduled runs even
+though any single run is time-boxed well under GitHub's own job limits
+(`TRACKER_MAX_RUN_SECONDS` in the workflow, currently 1,500s — no 15-minute
+sleep timer to work around here, so it can afford a bigger budget than the
+600s default tuned for interactive hosts).
 
-### A live link, continuously self-refreshing, company panel included
+The trade-off, and it's real: this copy refreshes on a schedule, not the
+instant someone opens it, and it doesn't have the **+ Add / remove
+companies** panel — that needs a live Python process behind it, which a
+static Pages site doesn't have. Add companies by editing `companies.yaml`
+(by hand, via `python -m tracker add`, or via `import_excel_companies.py`)
+and pushing — same as any other change to the repo; the next scheduled run
+picks it up. If a public repo works for you, you can also just shorten the
+cron schedule for fresher data — Actions minutes are unlimited there, so
+there's no cost to running it hourly instead of daily.
 
-For that you need `tracker serve` reachable from outside your machine, which
-means running it somewhere other than your laptop, **and it needs to actually
-keep running** — the background refresh (see **How refreshing works** above)
-only happens while the process is alive, same as locally. Any small always-on
-host works — [Render](https://render.com), [Railway](https://railway.app), or
-[Fly.io](https://fly.io) all have tiers that comfortably fit this. In broad
-strokes: connect the repo, set the start command to
-`python -m tracker serve --port $PORT`, and set `refresh.port` to read from
-the `PORT` environment variable the host provides. Exact steps vary by
-provider — their own quickstarts for "deploy a Python web app" apply directly,
-since this is just a small `http.server` app with no framework dependency.
+### A live link with the company panel and instant refresh — needs somewhere that stays running
 
-**Free tiers that sleep the service when idle fight this model directly.**
-Render's free plan, for one, suspends the process after ~15 minutes with no
-inbound requests — which kills the background-refresh thread along with it,
-and a full cycle over this roster takes roughly 20 minutes, longer than that
-sleep window, so it may never finish one uninterrupted pass without a visitor
-keeping it awake. A paid "no sleep" tier (Render's Starter plan, roughly
-$7/month, is the cheapest one that qualifies) is the straightforward fix if
-you want the hosted copy to actually stay current the way it's designed to;
-otherwise expect it to only make partial progress between naps.
+For the full interactive experience (**Refresh now**, the company panel,
+data that's current the moment you open it because it's been refreshing
+itself continuously) you need `tracker serve` reachable from outside your
+machine and **actually running continuously** — the background refresh only
+happens while the process is alive, same as locally.
 
-Either path is a legitimate answer to "shareable link." Pick the daily one if
-what matters is that anyone can open it with zero setup; pick the always-on
-hosted one if what matters is that it behaves exactly like your local copy,
-continuously refreshing itself and all.
+**Free tiers that sleep the service when idle fight this directly, and it's
+not just a footnote — it actively breaks the always-on design.** [Render's
+free plan](https://render.com) sleeps after ~15 minutes with no inbound
+requests, killing an in-progress cycle, and its disk is ephemeral — every
+restart, sleep-and-wake included, resets to exactly what's committed to
+GitHub, discarding anything scraped since. If you've hit this, you're not
+missing a setting; it's a structural mismatch between that tier and this
+app, not a bug to work around. A few real ways past it:
+
+- **Run it locally instead** (`START TRACKER (Windows).bat`) — genuinely
+  free, no sleep, no ephemeral disk, works today with zero changes. The
+  honest best option if you're comfortable leaving a PC on.
+- **[Oracle Cloud's "Always Free" tier](https://www.oracle.com/cloud/free/)**
+  — a real, persistent, always-on small VM (ARM Ampere A1 or x86 micro
+  instances) at zero cost indefinitely, not a time-limited trial. This is
+  the closest thing to "Render, but actually free and not fighting the
+  design" available today. The catch is setup: it's a bare VM, not a
+  connect-your-repo-and-click-deploy platform, so you're SSHing in,
+  installing Python, and running `tracker serve` yourself (a systemd service
+  or a persistent `tmux`/`screen` session both work) rather than following a
+  quickstart. Oracle also requires a credit card for identity verification
+  even though the tier itself is free, and has been known to reclaim
+  under-utilized Always Free instances in some regions — worth reading their
+  current terms before committing to it for something you care about.
+- **A paid "no sleep + persistent disk" tier** — Render's Starter plan
+  (roughly $7/month) is the cheapest one on Render that qualifies; `render.yaml`
+  already has a commented persistent-disk block ready to uncomment if you go
+  this way. [Railway](https://railway.app) and [Fly.io](https://fly.io) are
+  the other usual names in this space, technically a good fit (both support
+  persistent volumes and can be configured not to scale to zero) — but
+  neither currently has a true unlimited free tier the way they once did
+  (Railway moved to a small starting credit + usage-based pricing; Fly.io's
+  free allowance is limited and terms shift), so check current pricing
+  before assuming "free" there.
+
+Either path is a legitimate answer to "shareable link" — pick GitHub Pages if
+what matters is that anyone can open it at zero cost with zero setup and
+periodic freshness is fine; pick an always-on host (paid, local, or Oracle's
+free VM) if what matters is that it behaves exactly like your local copy,
+refresh button and all, continuously.
 
 ---
 
