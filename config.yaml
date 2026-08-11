@@ -36,6 +36,23 @@ run:
   # delay above, so this mainly helps when tracking many companies spread
   # across many different IR domains.
   max_workers: 12
+  # A ceiling on how long any single fetch will wait in a shared host's
+  # politeness queue before giving up on that one source for this run
+  # (it'll get another chance next run — see the shuffled fetch order
+  # note on max_run_seconds below). Exists because a wait *inside* that
+  # queue can't be interrupted by max_run_seconds the way waiting for a
+  # result can: once a worker thread has picked up a task and started
+  # sleeping here, it's committed until its reserved slot arrives. With
+  # thousands of companies sharing one host (news.google.com, say) and
+  # request submission being near-instant, that queue can silently grow
+  # to hours deep — and because those worker threads aren't daemon
+  # threads, the whole process wouldn't exit until every one of them
+  # finished, no matter what max_run_seconds said. This is what actually
+  # bounds that: 45s deep and a fetch just fails fast instead of queuing
+  # further back. (Confirmed on real infrastructure, not just estimated:
+  # this is why a run tuned for ~25 minutes took a real 5 hours on GitHub
+  # Actions before this ceiling existed.)
+  max_polite_wait_seconds: 45
   # Raised so a full year of SEC filings can come back in one pull. RSS feeds
   # cap themselves (most carry 20-50 recent items) so this mainly affects
   # EDGAR, which is the one source that genuinely reaches back years.

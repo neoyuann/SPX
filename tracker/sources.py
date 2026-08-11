@@ -52,6 +52,11 @@ def _delay_for(host: str, cfg: dict) -> float:
     return float((cfg.get("run", {}) or {}).get("polite_delay_seconds", 1.0))
 
 
+class PolitenessQueueBacklogged(Exception):
+    """Raised instead of sleeping when a shared host's politeness queue is
+    backed up past a sane ceiling. See _be_polite for why this exists."""
+
+
 def _be_polite(url: str, cfg: dict):
     host = _host(url)
     delay = _delay_for(host, cfg)
@@ -61,12 +66,31 @@ def _be_polite(url: str, cfg: dict):
     # the lock. A thread must never re-read the shared marker after this —
     # doing that let concurrent callers keep pushing each other's wake time
     # forward (an earlier version of this function livelocked that way).
+    #
+    # If the reservation queue for this host is already backed up past
+    # max_polite_wait_seconds, don't reserve a slot or sleep for it at all —
+    # raise instead, so the caller treats this one fetch as failed (it'll
+    # get another chance next run) rather than blocking a worker thread for
+    # a very long time. This matters a lot at real scale: with thousands of
+    # companies sharing one host (news.google.com, say) and a bounded pool
+    # of workers, upfront submission means many threads dequeue a task and
+    # start sleeping *before* the overall run-level deadline check ever gets
+    # a chance to matter to them — a thread already sleeping here can't be
+    # cancelled, and since ThreadPoolExecutor's worker threads are
+    # non-daemon, the whole process (and whatever's waiting on it — a CI
+    # job, a shell) doesn't exit until every one of them finishes. Without
+    # this ceiling, a deep-enough backlog turned a ~25-minute intended
+    # budget into 5 real hours on GitHub Actions before this was caught.
+    ceiling = float((cfg.get("run", {}) or {}).get("max_polite_wait_seconds", 45))
     with _last_hit_lock:
         now = time.monotonic()
         last = _last_hit.get(host)
         next_slot = now if last is None else max(now, last + delay)
+        wait = next_slot - now
+        if wait > ceiling:
+            raise PolitenessQueueBacklogged(
+                f"{host}'s queue is {wait:.0f}s deep (over the {ceiling:.0f}s ceiling)")
         _last_hit[host] = next_slot
-    wait = next_slot - time.monotonic()
     if wait > 0:
         time.sleep(wait)
 
@@ -99,7 +123,7 @@ def link_is_alive(session: requests.Session, url: str, cfg: dict) -> bool:
             r.close()
             return r.status_code < 400
         return False
-    except requests.RequestException:
+    except (requests.RequestException, PolitenessQueueBacklogged):
         return False
 
 
