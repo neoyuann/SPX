@@ -47,7 +47,17 @@ class Classifier:
                     return ClassifiedItem(raw=item, category=cat_key, label=label,
                                            score=99.0, matched_on=[f"8-K item {code}"])
 
-        text = f"{item.title}\n{item.summary}"
+        # classify() runs on the thread that called it (the pipeline's main
+        # thread, for a freshly-fetched item) with the GIL held for the
+        # whole duration of each pattern.search() — unlike a slow network
+        # call, nothing else in the process can make progress while one of
+        # these is running, and no run-level deadline can interrupt it
+        # either. Patterns here use bounded quantifiers like .{0,120}, so
+        # match cost scales with input length; capping that length bounds
+        # the worst case no matter how large upstream text gets. (Fetchers
+        # already cap title/summary at the source for the same reason —
+        # this is the last line of defense, not the only one.)
+        text = f"{item.title}\n{item.summary}"[:2000]
         best_key, best_score, best_matches = None, 0.0, []
         for key, cat in self.categories.items():
             score = 0.0

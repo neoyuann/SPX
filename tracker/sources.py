@@ -217,11 +217,18 @@ def fetch_rss(source: dict, company: dict, cfg: dict, session: requests.Session)
     max_items = int(cfg.get("run", {}).get("max_items_per_source", 250))
     items = []
     for entry in parsed.entries[:max_items]:
-        title = (entry.get("title") or "").strip()
+        # Capped *before* anything scans it, not just before storage — a
+        # feed entry's raw title/summary is attacker- or garbage-controlled
+        # text of unbounded length, and regex matching against it (here and
+        # in classify.py) runs on the calling thread with the GIL held for
+        # the whole call. A stray multi-hundred-KB entry once turned one
+        # `.search()` into an hours-long stall that blocked everything else
+        # in the process, not just that one item — see classify.py.
+        title = (entry.get("title") or "").strip()[:300]
         link = (entry.get("link") or "").strip()
         if not title or not link:
             continue
-        summary = re.sub("<[^<]+?>", " ", entry.get("summary", "") or "")
+        summary = re.sub("<[^<]+?>", " ", entry.get("summary", "") or "")[:600].strip()
         pub = _entry_date(entry)
         event_date, event_time = extract_event_datetime(f"{title} {summary}", pub)
         items.append(RawItem(
@@ -230,7 +237,7 @@ def fetch_rss(source: dict, company: dict, cfg: dict, session: requests.Session)
             exchange=company.get("exchange", ""),
             source_type="rss", tier=source.get("tier", "company_ir"),
             title=title, link=link, published=event_date, published_time=event_time,
-            summary=summary.strip()[:600], publisher=_host(url),
+            summary=summary, publisher=_host(url),
         ))
     return items
 
@@ -254,7 +261,11 @@ def fetch_ir_page(source: dict, company: dict, cfg: dict, session: requests.Sess
         link_node = node.select_one(link_sel) or title_node
         if title_node is None or link_node is None:
             continue
-        title = title_node.get_text(strip=True)
+        # Capped for the same reason fetch_rss caps its title/summary: an
+        # over-broad selector can match a container holding a whole page's
+        # text, and unbounded text reaching a regex search (here or in
+        # classify.py) can stall the calling thread for a very long time.
+        title = title_node.get_text(strip=True)[:300]
         href = link_node.get("href") if link_node.has_attr("href") else None
         if not title or not href:
             continue
@@ -267,9 +278,9 @@ def fetch_ir_page(source: dict, company: dict, cfg: dict, session: requests.Sess
         raw_date_text = ""
         pub = None
         if date_node is not None:
-            raw_date_text = date_node.get_text(strip=True)
+            raw_date_text = date_node.get_text(strip=True)[:200]
             if date_node.has_attr("datetime"):
-                raw_date_text = date_node["datetime"]
+                raw_date_text = date_node["datetime"][:200]
             try:
                 pub = dateparser.parse(raw_date_text, fuzzy=True).date().isoformat()
             except Exception:
@@ -408,7 +419,7 @@ def fetch_news(source: dict, company: dict, cfg: dict, session: requests.Session
     max_items = int(cfg.get("run", {}).get("max_items_per_source", 250))
     items = []
     for entry in parsed.entries[:max_items]:
-        title = (entry.get("title") or "").strip()
+        title = (entry.get("title") or "").strip()[:300]
         source_info = entry.get("source") or {}
         publisher_url = source_info.get("href") or ""
         publisher_name = source_info.get("title") or ""

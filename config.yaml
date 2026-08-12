@@ -100,6 +100,19 @@ run:
   # minutes end-to-end at 1800s, mostly rate-limited behind
   # news.google.com — see host_delay_overrides above).
   max_run_seconds: 600
+  # Wall-clock ceiling on the link-check-and-store phase that follows
+  # fetching — deliberately a separate, generous budget rather than sharing
+  # max_run_seconds above (see pipeline.py's module docstring for why that
+  # phase runs unconditionally at all). This exists because that phase used
+  # to have no bound whatsoever: a bare `with ThreadPoolExecutor(...) as
+  # pool:` block whose implicit exit calls shutdown(wait=True)
+  # unconditionally, so even wrapping its as_completed() in a timeout
+  # wouldn't have helped once one bad link-check wedged a worker thread —
+  # and since this phase logs nothing per item, that kind of stall is
+  # silent. This is what turned a job budgeted for well under an hour into
+  # one GitHub Actions had to kill at its own 6-hour hard limit, with no
+  # error and no clue in the logs about which phase was even stuck.
+  max_link_check_seconds: 900
   user_agent: "CorporateEventTracker/1.0 (research use; contact: you@example.com)"
   # ^ SEC EDGAR requires a real contact address in the User-Agent. Put yours in.
 

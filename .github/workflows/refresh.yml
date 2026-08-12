@@ -41,6 +41,13 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Belt-and-suspenders: TRACKER_MAX_RUN_SECONDS (25 min) plus
+    # max_link_check_seconds (15 min, config.yaml) should bound the run
+    # itself well under this, but a runaway job used to sit in "in_progress"
+    # for GitHub's own 6-hour default hard limit before anyone noticed.
+    # This makes any future unbounded stall — from a cause not yet fixed,
+    # or a new one — visibly fail in under an hour instead.
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
 

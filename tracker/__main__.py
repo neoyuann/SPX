@@ -106,6 +106,23 @@ def cmd_run(args):
         fh.write(page_html(events, meta, live=False))
     print(f"Wrote {out_path}")
 
+    # Everything that matters — every store write, the page itself — has
+    # already happened synchronously above. Exit immediately rather than
+    # returning normally: on normal return, the interpreter's own exit
+    # machinery joins every non-daemon thread still alive first, including
+    # ThreadPoolExecutor workers, and that join has no timeout of its own.
+    # pipeline.run()'s budgets bound how long *it* waits on those pools, but
+    # a straggler thread stuck in a call that never raises anything (a
+    # connection that neither completes nor times out — not fully ruled
+    # out even after bounding every call we could find) still blocks this
+    # from ever reaching the shell that's waiting on it, no matter what our
+    # own bookkeeping says finished. This is a one-shot CLI invocation
+    # (`python -m tracker run`, e.g. from CI) with nothing left to do after
+    # this line, so os._exit is the right tool here — unlike `serve`, there
+    # is no persistent process state or in-flight request an abrupt exit
+    # could corrupt.
+    os._exit(0)
+
 
 def cmd_render(args):
     cfg = load_yaml(args.config)

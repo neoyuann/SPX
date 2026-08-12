@@ -269,24 +269,31 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
 
     # Verify every surviving link is actually live before it can reach the
     # page. An event that loses its only link is dropped rather than shown
-    # pointing somewhere dead. This always runs to completion over whatever
-    # was grouped, regardless of run.max_run_seconds — that budget bounds
-    # fetching (above), not this. Fetching already decided what got
-    # gathered within budget; having done that work, throwing it away here
-    # because the clock read past the budget during fetching would discard
-    # a run's entire output. (It used to, silently — see the module
-    # docstring.) Each check still has its own per-request timeout, so this
-    # can't hang, just take a while on a very large batch — and it's
-    # already a background thread, so that's a fine trade.
+    # pointing somewhere dead. This always runs regardless of run.max_run_seconds
+    # — that budget bounds fetching (above), not this — but it still needs its
+    # *own* bound. Each check has a per-request timeout, but that only covers
+    # one connection attempt; anything that doesn't cleanly resolve to a
+    # timeout exception (a redirect loop, an odd keep-alive stall) can still
+    # wedge a worker thread forever, and this phase prints nothing per item —
+    # so a stall here is silent, unlike the fetch loop above. It used to run
+    # inside a bare `with ThreadPoolExecutor(...) as pool:`, whose implicit
+    # __exit__ calls shutdown(wait=True) unconditionally — exactly the same
+    # unbounded-wait mistake the fetch loop above was rewritten to avoid, just
+    # reintroduced one phase later. A group whose links don't finish checking
+    # in time is simply left out of this run's output (never shown with an
+    # unverified/dead link) and gets checked again next run, same as any
+    # other source this run ran out of time for.
     def check_one(g):
         live = [s for s in g["sources"] if link_is_alive(session, s["url"], cfg)]
         return g, live
 
     kept = []
     link_check_failed = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        futures = [pool.submit(check_one, g) for g in grouped]
-        for future in as_completed(futures):
+    link_check_budget = float((cfg.get("run", {}) or {}).get("max_link_check_seconds", 900))
+    check_pool = ThreadPoolExecutor(max_workers=max_workers)
+    futures = {check_pool.submit(check_one, g): g for g in grouped}
+    try:
+        for future in as_completed(futures, timeout=link_check_budget) if futures else iter(()):
             g, live_sources = future.result()
             if not live_sources:
                 link_check_failed += 1
@@ -297,6 +304,11 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
                 g["event"]["primary_url"] = live_sources[0]["url"]
             g["sources"] = live_sources
             kept.append(g)
+    except TimeoutError:
+        out_of_time = True
+        check_pool.shutdown(wait=False, cancel_futures=True)
+    else:
+        check_pool.shutdown(wait=True)
 
     new_count = 0
     changed_count = 0
