@@ -394,39 +394,79 @@ def _find_scheduled_date(doc_text: str, today: date) -> Optional[tuple[str, str]
     return None
 
 
-def _fetch_scheduled_event(session: requests.Session, cfg: dict, company: dict,
-                            filing_url: str, form: str, fdate: str, item_code: str) -> Optional[RawItem]:
+_EXHIBIT_NAME_RE = re.compile(r"ex-?99", re.IGNORECASE)
+_MAX_EXHIBIT_CANDIDATES = 3
+
+
+def _find_exhibit_urls(session: requests.Session, cfg: dict, cik: str, accn_nodash: str) -> list[str]:
+    """A large filer's 8-K cover page (primaryDocument — the only thing
+    fetched below before this existed) is typically a bare item list that
+    says "see Exhibit 99.1" with no narrative text of its own; the actual
+    "will host a conference call on [date]" language lives in that exhibit,
+    a separate document in the same filing. EX-99.x is the SEC's own
+    convention for a press-release exhibit, so that's what this looks for
+    in the filing's document index rather than guessing a filename."""
+    try:
+        idx_url = f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accn_nodash}/index.json"
+        r = _get(session, idx_url, cfg)
+        r.raise_for_status()
+        entries = ((r.json().get("directory") or {}).get("item") or [])
+    except Exception:
+        return []
+    urls = []
+    for entry in entries:
+        name = str(entry.get("name", ""))
+        etype = str(entry.get("type", ""))
+        if "99" in etype or _EXHIBIT_NAME_RE.search(name):
+            urls.append(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accn_nodash}/{name}")
+        if len(urls) >= _MAX_EXHIBIT_CANDIDATES:
+            break
+    return urls
+
+
+def _fetch_scheduled_event(session: requests.Session, cfg: dict, company: dict, cik: str,
+                            accn_nodash: str, filing_url: str, form: str, fdate: str,
+                            item_code: str) -> Optional[RawItem]:
     if fdate < (date.today() - timedelta(days=_SCHEDULE_LOOKBACK_DAYS)).isoformat():
         return None
     codes = {c.strip() for c in item_code.split(",")} if item_code else set()
     if not codes & _SCHEDULE_ITEM_CODES:
         return None
-    try:
-        r = _get(session, filing_url, cfg)
-        r.raise_for_status()
-        doc_text = BeautifulSoup(r.content, "lxml").get_text(" ", strip=True)
-        found = _find_scheduled_date(doc_text, date.today())
-    except Exception:
-        return None
-    if not found:
-        return None
-    sched_date, keyword = found
-    return RawItem(
-        ticker=company["ticker"], company_name=company["name"],
-        country=company.get("country", ""), region=company.get("region", ""),
-        exchange=company.get("exchange", ""),
-        source_type="sec_edgar", tier="regulatory",
-        title=f"{company['name']}: {keyword.title()} scheduled",
-        link=filing_url, published=sched_date, published_time=None,
-        summary=f"Found in {form} filed {fdate}.", publisher="sec.gov",
-        # Deliberately no sec_item here, unlike the filing-fact item above:
-        # setting it would make classify() bypass keyword scoring via
-        # sec_item_map and force this into "Earnings Release" for every
-        # 2.02 filing, even when the title says "Conference Call scheduled"
-        # or "Capital Markets Day scheduled" — the keyword match on the
-        # title itself lands this in the right category instead.
-        sec_item=None,
-    )
+    # Check the cover page first (cheap — already have the URL, no extra
+    # index lookup), then fall back to the press-release exhibit only if
+    # that comes up empty, since most filings have one and it's where this
+    # sort of language actually lives.
+    candidates = [filing_url]
+    for i, doc_url in enumerate(candidates):
+        try:
+            r = _get(session, doc_url, cfg)
+            r.raise_for_status()
+            doc_text = BeautifulSoup(r.content, "lxml").get_text(" ", strip=True)
+            found = _find_scheduled_date(doc_text, date.today())
+        except Exception:
+            found = None
+        if found:
+            sched_date, keyword = found
+            return RawItem(
+                ticker=company["ticker"], company_name=company["name"],
+                country=company.get("country", ""), region=company.get("region", ""),
+                exchange=company.get("exchange", ""),
+                source_type="sec_edgar", tier="regulatory",
+                title=f"{company['name']}: {keyword.title()} scheduled",
+                link=doc_url, published=sched_date, published_time=None,
+                summary=f"Found in {form} filed {fdate}.", publisher="sec.gov",
+                # Deliberately no sec_item here, unlike the filing-fact item
+                # above: setting it would make classify() bypass keyword
+                # scoring via sec_item_map and force this into "Earnings
+                # Release" for every 2.02 filing, even when the title says
+                # "Conference Call scheduled" or "Capital Markets Day
+                # scheduled" — the keyword match on the title itself lands
+                # this in the right category instead.
+                sec_item=None,
+            )
+        if i == 0:
+            candidates.extend(_find_exhibit_urls(session, cfg, cik, accn_nodash))
+    return None
 
 
 def fetch_sec_edgar(source: dict, company: dict, cfg: dict, session: requests.Session) -> list[RawItem]:
@@ -475,7 +515,8 @@ def fetch_sec_edgar(source: dict, company: dict, cfg: dict, session: requests.Se
             summary=f"SEC form {form} filed {fdate}.", publisher="sec.gov",
             sec_item=item_code or None,
         ))
-        scheduled = _fetch_scheduled_event(session, cfg, company, filing_url, form, fdate, item_code)
+        scheduled = _fetch_scheduled_event(session, cfg, company, cik, accn_nodash,
+                                            filing_url, form, fdate, item_code)
         if scheduled:
             items.append(scheduled)
     return items
