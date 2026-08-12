@@ -13,7 +13,7 @@ import re
 import threading
 import time
 import urllib.parse
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from typing import Optional
 from urllib.parse import urljoin, urlparse
 
@@ -343,6 +343,92 @@ def resolve_cik(session: requests.Session, cfg: dict, ticker: str) -> Optional[s
     return _load_cik_map(session, cfg).get(base)
 
 
+# An 8-K's own *metadata* only ever carries a filing date — the date it was
+# disclosed, not any date it might describe — so sec_edgar's items above are
+# structurally unable to produce an "upcoming" event no matter how far
+# lookahead_days reaches. But the filing's own document (the press release
+# it furnishes) often does name a real future date: an item 2.02 earnings
+# 8-K commonly says "will host a conference call on [date]", and an item
+# 7.01 Reg FD 8-K is the standard vehicle for announcing an investor day or
+# capital markets day weeks or months out. This is the one place that
+# information can come from for the ~1,250 companies that only have
+# sec_edgar + news (no ir_page calendar) configured.
+#
+# Kept deliberately narrow to avoid two different failure modes:
+#   - cost: only chases the document for filings that are both the right
+#     item code AND recently filed, not the company's whole filing history,
+#     so this adds roughly one extra request per company per run at most,
+#     not one per historical filing
+#   - correctness: SEC filing text is full of unrelated dates (fiscal
+#     year-ends, prior-period comparisons, boilerplate) — a bare date match
+#     isn't enough signal, so a candidate is only trusted when a scheduling
+#     keyword sits close to it AND the date is a sane distance in the
+#     future. Getting this wrong would put a wrong date on the page with
+#     the same confidence as a verified filing fact, which is worse than
+#     just not showing it.
+_SCHEDULE_ITEM_CODES = {"2.02", "7.01"}
+_SCHEDULE_LOOKBACK_DAYS = 30
+_SCHEDULE_MAX_FUTURE_DAYS = 180
+_SCHEDULE_TEXT_CAP = 20000
+_SCHEDULE_KEYWORDS_RE = re.compile(
+    r"\b(conference\s+call|webcast|earnings\s+call|investor\s+day|"
+    r"analyst\s+day|capital\s+markets?\s+day)\b", re.IGNORECASE)
+
+
+def _find_scheduled_date(doc_text: str, today: date) -> Optional[tuple[str, str]]:
+    text = doc_text[:_SCHEDULE_TEXT_CAP]
+    for pattern in DATE_PHRASE_PATTERNS:
+        for m in pattern.finditer(text):
+            window = text[max(0, m.start() - 100): m.end() + 100]
+            kw = _SCHEDULE_KEYWORDS_RE.search(window)
+            if not kw:
+                continue
+            try:
+                dt = dateparser.parse(m.group(0), fuzzy=True,
+                                       default=datetime(today.year, 1, 1))
+            except (ValueError, OverflowError):
+                continue
+            found = dt.date()
+            if today < found <= today + timedelta(days=_SCHEDULE_MAX_FUTURE_DAYS):
+                return found.isoformat(), kw.group(0)
+    return None
+
+
+def _fetch_scheduled_event(session: requests.Session, cfg: dict, company: dict,
+                            filing_url: str, form: str, fdate: str, item_code: str) -> Optional[RawItem]:
+    if fdate < (date.today() - timedelta(days=_SCHEDULE_LOOKBACK_DAYS)).isoformat():
+        return None
+    codes = {c.strip() for c in item_code.split(",")} if item_code else set()
+    if not codes & _SCHEDULE_ITEM_CODES:
+        return None
+    try:
+        r = _get(session, filing_url, cfg)
+        r.raise_for_status()
+        doc_text = BeautifulSoup(r.content, "lxml").get_text(" ", strip=True)
+        found = _find_scheduled_date(doc_text, date.today())
+    except Exception:
+        return None
+    if not found:
+        return None
+    sched_date, keyword = found
+    return RawItem(
+        ticker=company["ticker"], company_name=company["name"],
+        country=company.get("country", ""), region=company.get("region", ""),
+        exchange=company.get("exchange", ""),
+        source_type="sec_edgar", tier="regulatory",
+        title=f"{company['name']}: {keyword.title()} scheduled",
+        link=filing_url, published=sched_date, published_time=None,
+        summary=f"Found in {form} filed {fdate}.", publisher="sec.gov",
+        # Deliberately no sec_item here, unlike the filing-fact item above:
+        # setting it would make classify() bypass keyword scoring via
+        # sec_item_map and force this into "Earnings Release" for every
+        # 2.02 filing, even when the title says "Conference Call scheduled"
+        # or "Capital Markets Day scheduled" — the keyword match on the
+        # title itself lands this in the right category instead.
+        sec_item=None,
+    )
+
+
 def fetch_sec_edgar(source: dict, company: dict, cfg: dict, session: requests.Session) -> list[RawItem]:
     cik = str(source.get("cik") or "").strip()
     if cik:
@@ -389,6 +475,9 @@ def fetch_sec_edgar(source: dict, company: dict, cfg: dict, session: requests.Se
             summary=f"SEC form {form} filed {fdate}.", publisher="sec.gov",
             sec_item=item_code or None,
         ))
+        scheduled = _fetch_scheduled_event(session, cfg, company, filing_url, form, fdate, item_code)
+        if scheduled:
+            items.append(scheduled)
     return items
 
 
