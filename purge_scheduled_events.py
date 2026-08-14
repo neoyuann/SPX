@@ -21,6 +21,7 @@ Usage:  python purge_scheduled_events.py [--db data/events.db] [--dry-run]
 from __future__ import annotations
 
 import argparse
+import re
 import sqlite3
 
 # Exactly the headline shape _fetch_scheduled_event builds:
@@ -28,17 +29,40 @@ import sqlite3
 SCHEDULED_HEADLINE = "%: % scheduled"
 
 
+def _is_implausible(event_time: str | None) -> bool:
+    """Mirrors sources._IMPLAUSIBLE_EVENT_HOURS: no meeting or earnings call
+    starts between 10pm and 5am, so a stored time in that window marks a row
+    that came from a proxy voting deadline rather than the meeting."""
+    m = re.match(r"(\d{1,2}):(\d{2})\s*(am|pm)?", event_time or "", re.IGNORECASE)
+    if not m:
+        return False
+    hour, meridiem = int(m.group(1)), (m.group(3) or "").lower()
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    return hour >= 22 or hour < 5
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="data/events.db")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--implausible-times-only", action="store_true",
+                    help="Only remove rows whose stored time is one no real "
+                         "event starts at — the voting-deadline signature. "
+                         "Use when the extraction is already correct and only "
+                         "rows predating the fix need clearing, so the "
+                         "correct ones aren't needlessly re-derived.")
     args = ap.parse_args()
 
     conn = sqlite3.connect(args.db)
     conn.row_factory = sqlite3.Row
     rows = conn.execute(
-        "SELECT id, ticker, event_date, headline FROM events WHERE headline LIKE ?",
+        "SELECT id, ticker, event_date, event_time, headline FROM events WHERE headline LIKE ?",
         (SCHEDULED_HEADLINE,)).fetchall()
+    if args.implausible_times_only:
+        rows = [r for r in rows if _is_implausible(r["event_time"])]
 
     if not rows:
         print("No scheduled-scan events found — nothing to purge.")
@@ -46,7 +70,7 @@ def main() -> int:
 
     print(f"{len(rows)} event(s) from the scheduled-date scan:")
     for r in rows[:10]:
-        print(f"  {r['ticker']:10s} {r['event_date']}  {r['headline']}")
+        print(f"  {r['ticker']:10s} {r['event_date']}  {r['event_time'] or '-':22s} {r['headline']}")
     if len(rows) > 10:
         print(f"  … and {len(rows) - 10} more")
 
