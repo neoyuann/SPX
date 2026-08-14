@@ -45,6 +45,15 @@ run:
   # get their own, still-polite, delay instead of the default.
   host_delay_overrides:
     data.sec.gov: 0.12
+    # Same operator, same published 10-requests-per-second guideline as
+    # data.sec.gov above, but a different hostname — so without its own entry
+    # it fell back to polite_delay_seconds (1.0s) and every request
+    # serialised a full second behind the last. This is the host the filing
+    # text scan reads from (cover page, filing index, press-release exhibit)
+    # and where the ticker->CIK map lives, so that default silently made the
+    # scan the slowest thing in the run: one refresh skipped 885 of 1247
+    # sec_edgar sources for lack of time, having spent it waiting here.
+    www.sec.gov: 0.12
     news.google.com: 0.4
   # How many (company, source) fetches run at once. Different hosts run
   # concurrently; requests to the *same* host still queue behind that host's
