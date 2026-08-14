@@ -67,6 +67,28 @@ jobs:
 
       - run: pip install -r requirements.txt
 
+      # The accumulated database is state, not source, and it is large and
+      # binary — committing it every hour added ~1.8GB a day to the repo and
+      # was heading for GitHub's hard 100MB-per-file limit (80MB and still
+      # growing as roster coverage fills in). It rides the Actions cache
+      # between hourly runs instead, with a compressed snapshot committed
+      # once a day (below) so a cache miss costs at most a day of catch-up
+      # rather than all the history.
+      - name: Restore accumulated data
+        uses: actions/cache@v4
+        with:
+          path: data/events.db
+          key: events-db-${{ github.run_id }}
+          restore-keys: events-db-
+
+      - name: Fall back to the daily snapshot on a cache miss
+        run: |
+          if [ ! -f data/events.db ] && [ -f data/events.db.gz ]; then
+            echo "Cache miss — restoring from the committed snapshot."
+            gunzip -c data/events.db.gz > data/events.db
+          fi
+          ls -lh data/events.db 2>/dev/null || echo "Starting from an empty database."
+
       - name: Fetch every source and build the static page
         env:
           SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
@@ -78,15 +100,24 @@ jobs:
           TRACKER_MAX_RUN_SECONDS: "1200"
         run: python -m tracker run
 
-      - name: Persist accumulated data
+      # Once a day, not every run: gzipped it is ~15MB against the raw
+      # 80MB, and one commit a day is a recoverable baseline without the
+      # repo growing by a database every hour.
+      - name: Snapshot the database to the repo (daily)
+        if: github.event_name == 'schedule'
         run: |
-          if git diff --quiet -- data/events.db; then
-            echo "No changes to data/events.db this run."
+          if [ "$(date -u +%H)" != "00" ]; then
+            echo "Not the daily snapshot hour — the Actions cache carries this run's data."
+            exit 0
+          fi
+          gzip -c -9 data/events.db > data/events.db.gz
+          if git diff --quiet -- data/events.db.gz; then
+            echo "Snapshot unchanged."
           else
             git config user.name "github-actions[bot]"
             git config user.email "github-actions[bot]@users.noreply.github.com"
-            git add data/events.db
-            git commit -m "Scheduled refresh: update tracked events [skip ci]"
+            git add data/events.db.gz
+            git commit -m "Daily snapshot: accumulated events [skip ci]"
             # A roster request (roster-request.yml) can land on the same
             # branch while this run was fetching, so don't assume the push
             # is a fast-forward. Rebase onto whatever arrived and retry.

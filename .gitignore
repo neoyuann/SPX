@@ -3,6 +3,10 @@ __pycache__/
 .venv/
 venv/
 data/*.db-journal
+# The working database is state, not source: large, binary, and rewritten
+# every run. The repo carries data/events.db.gz (a daily snapshot) instead,
+# and the Actions cache carries it between hourly runs.
+data/events.db
 out/
 
 *.log
