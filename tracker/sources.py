@@ -669,13 +669,20 @@ def fetch_sec_edgar(source: dict, company: dict, cfg: dict, session: requests.Se
             # filings, which are already gathered above.
             continue
 
+    # Filter before capping, not after. Most of what a company files is
+    # forms this never uses — Form 4s especially, which an active issuer
+    # files by the hundred — so applying the cap to the raw list spent the
+    # whole budget on rows that were then discarded, and the older filings
+    # appended from the shards above fell outside it entirely. Newest first,
+    # so if a company really does exceed the cap it's the oldest filings
+    # that are dropped rather than an arbitrary slice.
+    rows = [r for r in rows
+            if r[0] in _SEC_FORM_HINT and not (history_from and r[1] < history_from)]
+    rows.sort(key=lambda r: r[1] or "", reverse=True)
+
     max_items = int(cfg.get("run", {}).get("max_items_per_source", 250))
     items = []
     for form, fdate, accn, item_code, primary_doc in rows[:max_items]:
-        if history_from and fdate < history_from:
-            continue
-        if form not in _SEC_FORM_HINT:
-            continue
         accn_nodash = accn.replace("-", "")
         filing_url = (f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/"
                       f"{accn_nodash}/{primary_doc}" if primary_doc else

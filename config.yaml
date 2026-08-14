@@ -77,9 +77,14 @@ run:
   # this is why a run tuned for ~25 minutes took a real 5 hours on GitHub
   # Actions before this ceiling existed.)
   max_polite_wait_seconds: 45
-  # Raised so a full year of SEC filings can come back in one pull. RSS feeds
-  # cap themselves (most carry 20-50 recent items) so this mainly affects
-  # EDGAR, which is the one source that genuinely reaches back years.
+  # RSS feeds cap themselves (most carry 20-50 recent items) so this mainly
+  # affects EDGAR, the one source that genuinely reaches back years. For
+  # EDGAR it counts filings this tool actually uses, applied after the form
+  # and history_from filters — an active issuer files hundreds of Form 4s
+  # that are never events, and counting those first spent the whole budget
+  # on rows that were then discarded, leaving barely any history behind.
+  # 250 usable filings is roughly 35 a year across the window history_from
+  # asks for.
   max_items_per_source: 250
   # Ceiling on the *fetching* phase, wall-clock — not the whole run.
   # Classifying, grouping, link-checking and storing whatever was actually
