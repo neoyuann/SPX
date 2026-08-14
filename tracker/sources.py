@@ -414,7 +414,9 @@ _SCHEDULE_ITEM_CODES = {"2.02", "7.01", "8.01"}
 _SCHEDULE_FORMS = {"DEF 14A", "DEFA14A"}
 _SCHEDULE_LOOKBACK_DAYS = 30
 _SCHEDULE_PROXY_LOOKBACK_DAYS = 120
-_SCHEDULE_MAX_FUTURE_DAYS = 300
+# A full annual cycle plus margin: an AGM is routinely announced ten or
+# eleven months ahead, and a tighter horizon silently discarded those.
+_SCHEDULE_MAX_FUTURE_DAYS = 400
 _SCHEDULE_TEXT_CAP = 20000
 _SCHEDULE_KEYWORDS_RE = re.compile(
     r"\b(conference\s+call|webcast|earnings\s+call|investor\s+day|"
@@ -425,30 +427,81 @@ _SCHEDULE_KEYWORDS_RE = re.compile(
     re.IGNORECASE)
 
 
+# Dates that sit next to a scheduling keyword but do not date the event.
+# The one that actually caused wrong dates on the page: an earnings release
+# says the call is "today ... Monday, August 10, 2026" and then, a sentence
+# later, that "an audio replay of the conference call will be available
+# until August 17, 2026". Scanning for any future date near the words
+# "conference call" rejected the real (already past) call date and reported
+# the replay's expiry as the event — an event that never existed, dated a
+# week after the call it referred to.
+_SCHEDULE_NEGATIVE_RE = re.compile(
+    r"\b(replay|rebroadcast|re-?air|archiv\w*|on[-\s]?demand|podcast|transcript|"
+    r"available\s+(?:until|through|for|from)|accessible\s+(?:until|through)|"
+    r"expires?|expiring|through\s+\w+\s+\d|until|"
+    # Dates that appear right beside "annual meeting" in a proxy but date
+    # something else entirely. The record date ("holders of record as of
+    # March 15, 2027 are entitled to vote at the Annual Meeting") and the
+    # fiscal year end ("for the fiscal year ending December 31, 2026") are
+    # the two that actually produced wrong entries — several meetings were
+    # stored as 31 December, which is a year end, not a meeting.
+    r"fiscal\s+year|year\s+end(?:ing|ed)?|record\s+date|"
+    r"(?:holders?|shareholders?|stockholders?)\s+of\s+record|as\s+of\s+the\s+close)\b",
+    re.IGNORECASE)
+
+# Sentence-ish split. The "p.m." in "6:00 p.m. Eastern Daylight Time,
+# Monday, August 10, 2026" is not a sentence end, and treating it as one
+# splits the clock away from the date it belongs to — which loses the
+# announcement entirely, since neither half then has both a keyword and a
+# date. Hence the negative lookbehind for a.m./p.m.
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?;])(?<![ap]\.m\.)\s+(?=[A-Z0-9])", re.IGNORECASE)
+
+
 def _find_scheduled_date(doc_text: str, today: date) -> Optional[tuple[str, str, Optional[str]]]:
-    """Returns (date, matched keyword, time-of-day or None). The time is read
-    from the same window as the date rather than the whole document, since a
-    filing that says "call on August 25, 2026 at 8:30 a.m. ET" states both
-    together — searching the whole text would happily pair the date with a
-    clock from some unrelated paragraph."""
+    """Returns (date, matched keyword, time-of-day or None), or None when the
+    document doesn't announce a genuine upcoming event.
+
+    Works sentence by sentence rather than by proximity window. A date only
+    counts when it shares a sentence with the scheduling keyword it's meant
+    to date, and when nothing in that sentence marks it as a replay or
+    availability window (see _SCHEDULE_NEGATIVE_RE). Crucially, a sentence
+    that announces an event which has already happened yields nothing at
+    all — it does *not* fall through to some other future-looking date
+    elsewhere in the document, which is exactly how a replay-expiry date
+    ended up on the page as though it were a scheduled call."""
     text = doc_text[:_SCHEDULE_TEXT_CAP]
-    for pattern in DATE_PHRASE_PATTERNS:
-        for m in pattern.finditer(text):
-            window = text[max(0, m.start() - 100): m.end() + 100]
-            kw = _SCHEDULE_KEYWORDS_RE.search(window)
-            if not kw:
-                continue
-            try:
-                dt = dateparser.parse(m.group(0), fuzzy=True,
-                                       default=datetime(today.year, 1, 1))
-            except (ValueError, OverflowError):
-                continue
-            found = dt.date()
-            if today < found <= today + timedelta(days=_SCHEDULE_MAX_FUTURE_DAYS):
-                # Look just after the date phrase first ("...on Aug 25, 2026
-                # at 8:30 a.m. ET"), then the wider window.
-                after = text[m.end(): m.end() + 120]
-                return found.isoformat(), kw.group(0), _parse_clock(after) or _parse_clock(window)
+    for sentence in _SENTENCE_SPLIT_RE.split(text):
+        kw = _SCHEDULE_KEYWORDS_RE.search(sentence)
+        if not kw or _SCHEDULE_NEGATIVE_RE.search(sentence):
+            continue
+        for pattern in DATE_PHRASE_PATTERNS:
+            for m in pattern.finditer(sentence):
+                try:
+                    dt = dateparser.parse(m.group(0), fuzzy=True,
+                                           default=datetime(today.year, 1, 1))
+                except (ValueError, OverflowError):
+                    continue
+                found = dt.date()
+                if found <= today:
+                    # This sentence dates its event in the past, so there is
+                    # no upcoming event here. Stop rather than hunting for a
+                    # future date elsewhere — the alternative is reporting an
+                    # unrelated date as though it were this event's.
+                    return None
+                if found > today + timedelta(days=_SCHEDULE_MAX_FUTURE_DAYS):
+                    continue
+                # The clock usually sits in the same sentence as the date, on
+                # either side of it ("today from 5:00 p.m. ... Monday, August
+                # 10, 2026" puts it before). The zone can trail the end of a
+                # range ("5:00 p.m. to 6:00 p.m. Eastern Daylight Time"), so
+                # fall back to the sentence's own zone when the clock didn't
+                # carry one.
+                clock = _parse_clock(sentence[m.end():]) or _parse_clock(sentence)
+                if clock and not re.search(rf"({_TZ_NAMES})\b|{_TZ_WORDS}", clock, re.IGNORECASE):
+                    zone = re.search(rf"\b({_TZ_NAMES})\b|\b({_TZ_WORDS})", sentence, re.IGNORECASE)
+                    if zone:
+                        clock = f"{clock} {' '.join(zone.group(0).split())}"
+                return found.isoformat(), kw.group(0), clock
     return None
 
 
@@ -513,7 +566,11 @@ def _fetch_scheduled_event(session: requests.Session, cfg: dict, company: dict, 
                 country=company.get("country", ""), region=company.get("region", ""),
                 exchange=company.get("exchange", ""),
                 source_type="sec_edgar", tier="regulatory",
-                title=f"{company['name']}: {keyword.title()} scheduled",
+                # Collapse whitespace: the keyword is matched against text
+                # extracted from a filing's HTML, so it can straddle a line
+                # break ("Annual Meeting\nOf Stockholders") and carry it
+                # straight into the headline.
+                title=f"{company['name']}: {' '.join(keyword.split()).title()} scheduled",
                 link=doc_url, published=sched_date, published_time=sched_time,
                 summary=f"Found in {form} filed {fdate}.", publisher="sec.gov",
                 # Deliberately no sec_item here, unlike the filing-fact item
