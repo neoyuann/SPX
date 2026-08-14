@@ -137,6 +137,16 @@ def _group_into_events(classified: list, cfg: dict) -> list[dict]:
     return events
 
 
+def _trusted_by_construction(url: str) -> bool:
+    """A sec.gov Archives URL isn't guessed — sources.py assembles it from
+    SEC's own submissions index, out of the accession number and primary
+    document name that index reports for a filing it says exists. A HEAD
+    request to confirm that adds a network round-trip per filing (the bulk
+    of every URL on a US-heavy roster) to re-learn what the authoritative
+    index already said."""
+    return url.startswith("https://www.sec.gov/Archives/")
+
+
 def run(config_path: str, companies_path: str, *, verbose: bool = False,
         progress=None, only_ticker: str | None = None, no_news: bool = False):
     cfg = load_yaml(config_path)
@@ -268,47 +278,86 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
     grouped = _group_into_events(classified_items, cfg)
 
     # Verify every surviving link is actually live before it can reach the
-    # page. An event that loses its only link is dropped rather than shown
-    # pointing somewhere dead. This always runs regardless of run.max_run_seconds
-    # — that budget bounds fetching (above), not this — but it still needs its
-    # *own* bound. Each check has a per-request timeout, but that only covers
-    # one connection attempt; anything that doesn't cleanly resolve to a
-    # timeout exception (a redirect loop, an odd keep-alive stall) can still
-    # wedge a worker thread forever, and this phase prints nothing per item —
-    # so a stall here is silent, unlike the fetch loop above. It used to run
-    # inside a bare `with ThreadPoolExecutor(...) as pool:`, whose implicit
-    # __exit__ calls shutdown(wait=True) unconditionally — exactly the same
-    # unbounded-wait mistake the fetch loop above was rewritten to avoid, just
-    # reintroduced one phase later. A group whose links don't finish checking
-    # in time is simply left out of this run's output (never shown with an
-    # unverified/dead link) and gets checked again next run, same as any
-    # other source this run ran out of time for.
+    # page, so an event is never shown pointing somewhere dead.
+    #
+    # Three things keep this affordable, because a naive "one network
+    # round-trip per URL, every run" does not survive contact with a real
+    # roster. At a few thousand events this phase costs far more than the
+    # fetching it follows, and when it blew its own budget it silently
+    # dropped whatever hadn't been checked yet — a run reporting "18356
+    # grouped into events, 0 failed their link check, 858 kept" was
+    # discarding 95% of its own output, which is what made the page look
+    # like it had almost nothing on it:
+    #
+    #   1. URLs that are trusted by construction are never fetched at all.
+    #      A sec.gov Archives URL is assembled here from SEC's own
+    #      submissions index (accession number + primary document), so
+    #      asking the network to confirm what that index already stated is
+    #      pure cost — and it's ~94% of all source URLs on a US-heavy
+    #      roster.
+    #   2. Results are cached in the store and reused while fresh, so an
+    #      hourly run re-checks a given URL once a day, not 24 times.
+    #   3. Anything still unchecked when the budget runs out is *kept*
+    #      rather than dropped. These events were classified from a source
+    #      that was successfully fetched moments earlier; the link check is
+    #      a guard against link rot, not a precondition for the event being
+    #      real. Discarding them trades a whole run's work for a guarantee
+    #      that isn't worth that much — they get verified on a later run.
     def check_one(g):
-        live = [s for s in g["sources"] if link_is_alive(session, s["url"], cfg)]
-        return g, live
+        live = []
+        checked: dict[str, bool] = {}
+        for s in g["sources"]:
+            url = s["url"]
+            if _trusted_by_construction(url):
+                live.append(s)
+                continue
+            ok = cached_checks.get(url)
+            if ok is None:
+                ok = link_is_alive(session, url, cfg)
+                checked[url] = ok
+            if ok:
+                live.append(s)
+        return g, live, checked
 
+    link_check_ttl = float((cfg.get("run", {}) or {}).get("link_check_ttl_hours", 24))
+    cached_checks = store.fresh_link_checks(link_check_ttl)
     kept = []
     link_check_failed = 0
+    link_check_skipped = 0
+    new_checks: dict[str, bool] = {}
     link_check_budget = float((cfg.get("run", {}) or {}).get("max_link_check_seconds", 900))
     check_pool = ThreadPoolExecutor(max_workers=max_workers)
     futures = {check_pool.submit(check_one, g): g for g in grouped}
+    done_groups = set()
+
+    def keep(g, live_sources):
+        if not live_sources:
+            return False
+        live_urls = {s["url"] for s in live_sources}
+        if g["event"]["primary_url"] not in live_urls:
+            live_sources.sort(key=lambda s: tier_priority(s["tier"]))
+            g["event"]["primary_url"] = live_sources[0]["url"]
+        g["sources"] = live_sources
+        kept.append(g)
+        return True
+
     try:
         for future in as_completed(futures, timeout=link_check_budget) if futures else iter(()):
-            g, live_sources = future.result()
-            if not live_sources:
+            g, live_sources, checked = future.result()
+            done_groups.add(id(g))
+            new_checks.update(checked)
+            if not keep(g, live_sources):
                 link_check_failed += 1
-                continue
-            live_urls = {s["url"] for s in live_sources}
-            if g["event"]["primary_url"] not in live_urls:
-                live_sources.sort(key=lambda s: tier_priority(s["tier"]))
-                g["event"]["primary_url"] = live_sources[0]["url"]
-            g["sources"] = live_sources
-            kept.append(g)
     except TimeoutError:
         out_of_time = True
         check_pool.shutdown(wait=False, cancel_futures=True)
+        for future, g in futures.items():
+            if id(g) not in done_groups:
+                link_check_skipped += 1
+                keep(g, list(g["sources"]))
     else:
         check_pool.shutdown(wait=True)
+    store.record_link_checks(new_checks)
 
     new_count = 0
     changed_count = 0
@@ -323,7 +372,8 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
     # "why did a run store nothing" answerable from the History panel
     # instead of needing a terminal.
     stats = (f"{len(classified_items)} items classified, {len(grouped)} grouped into "
-             f"events, {link_check_failed} failed their link check, {len(kept)} kept")
+             f"events, {link_check_failed} failed their link check, "
+             f"{link_check_skipped} kept unverified (link check ran long), {len(kept)} kept")
     notes = stats
     if out_of_time and skipped_companies:
         notes += "; ran out of time, skipped: " + ", ".join(sorted(set(skipped_companies)))

@@ -7,7 +7,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 SCHEMA = """
@@ -55,6 +55,19 @@ CREATE TABLE IF NOT EXISTS changes (
     changed_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_changes_event ON changes(event_id);
+
+-- Link-check results, cached across runs. Verifying every event's link
+-- means a network round-trip per URL, and at a few thousand events that
+-- phase costs far more than the fetching it follows — enough that it used
+-- to blow its own time budget and silently drop most of a run's output.
+-- A URL that answered fine an hour ago is not worth re-asking about every
+-- single hourly run, so results are remembered and only rechecked once
+-- they go stale (see pipeline.link_check_ttl_hours).
+CREATE TABLE IF NOT EXISTS link_checks (
+    url TEXT PRIMARY KEY,
+    ok INTEGER NOT NULL,
+    checked_at TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS refresh_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -111,6 +124,26 @@ class Store:
             "SELECT * FROM refresh_runs WHERE finished_at IS NOT NULL "
             "ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
         return [dict(r) for r in rows]
+
+    # -- link checks ------------------------------------------------------
+    def fresh_link_checks(self, ttl_hours: float) -> dict[str, bool]:
+        """Every cached result still inside the TTL, as {url: ok}. Read once
+        per run rather than queried per-URL — a few thousand single-row
+        lookups from worker threads costs more than one scan."""
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=ttl_hours)).isoformat(timespec="seconds")
+        rows = self.conn.execute(
+            "SELECT url, ok FROM link_checks WHERE checked_at >= ?", (cutoff,)).fetchall()
+        return {r["url"]: bool(r["ok"]) for r in rows}
+
+    def record_link_checks(self, results: dict[str, bool]):
+        if not results:
+            return
+        now = _now_iso()
+        self.conn.executemany(
+            "INSERT INTO link_checks (url, ok, checked_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(url) DO UPDATE SET ok=excluded.ok, checked_at=excluded.checked_at",
+            [(url, 1 if ok else 0, now) for url, ok in results.items()])
+        self.conn.commit()
 
     # -- events -----------------------------------------------------------
     def upsert_event(self, event: dict, sources: list[dict]) -> str:

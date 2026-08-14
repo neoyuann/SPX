@@ -24,10 +24,54 @@ from dateutil import parser as dateparser
 
 from .models import DATE_PHRASE_PATTERNS, RawItem
 
+# A clock time needs a *qualifier* to count — either am/pm or a named zone.
+# Both used to be optional, which meant a bare "\d{1,2}[.:]\d{2}" matched any
+# decimal in the prose around an earnings release: "$0.45 per share" was
+# being stored as an event time of "0.45", and 6 of the 9 times ever
+# captured were figures like that rather than times. The negative lookbehind
+# keeps a currency amount or a longer number from being read as a clock even
+# when a zone happens to follow it.
+_TZ_NAMES = (r"CET|CEST|EST|EDT|GMT|UTC|SGT|HKT|JST|KST|BST|PDT|PST|CST|CDT|MST|MDT|"
+             r"IST|AEST|AEDT|NZST|MSK|EET|EEST|WET|ET|PT|CT|MT")
+_TZ_WORDS = (r"(?:US\s+)?(?:Eastern|Pacific|Central|Mountain|London|Paris|Frankfurt|"
+             r"Tokyo|Hong\s+Kong|Singapore|Sydney|Seoul|Taipei|Beijing)"
+             r"(?:\s+(?:Standard|Daylight|Summer))?(?:\s+Time)?")
 _TIME_RE = re.compile(
-    r"\b(\d{1,2}[:.]\d{2}\s?(?:am|pm|AM|PM)?)\s*"
-    r"(CET|CEST|EST|EDT|GMT|UTC|SGT|HKT|JST|KST|BST|PT|ET|PDT|PST|IST)?\b"
-)
+    r"(?<![\d.$€£¥])"
+    r"(\d{1,2}(?::\d{2})?(?:\.\d{2})?)\s*"
+    r"(?:(a\.?m\.?|p\.?m\.?)\s*)?"
+    rf"(?:({_TZ_NAMES})\b|({_TZ_WORDS}))?",
+    re.IGNORECASE)
+
+
+def _parse_clock(text: str) -> Optional[str]:
+    """Pull a genuine time-of-day out of prose, or None. Requires a real
+    qualifier (am/pm or a named zone) so figures in the surrounding text
+    can't be mistaken for a clock — see _TIME_RE."""
+    for m in _TIME_RE.finditer(text):
+        clock, meridiem, tz_abbr, tz_word = m.groups()
+        if not meridiem and not tz_abbr and not tz_word:
+            continue
+        if "." in clock and not meridiem:
+            continue  # "0.45" with no am/pm is a number, not a time
+        hour_str = clock.replace(".", ":").split(":")[0]
+        try:
+            hour = int(hour_str)
+        except ValueError:
+            continue
+        if hour > 23 or (meridiem and hour > 12):
+            continue
+        minute = clock.replace(".", ":").split(":")[1] if ":" in clock.replace(".", ":") else "00"
+        if int(minute) > 59:
+            continue
+        out = f"{hour}:{minute}"
+        if meridiem:
+            out += " " + meridiem.replace(".", "").lower()
+        zone = tz_abbr or tz_word
+        if zone:
+            out += " " + " ".join(zone.split()).upper() if tz_abbr else " " + " ".join(zone.split())
+        return out.strip()
+    return None
 
 # One clock per host, so requests to the same site stay spaced out even
 # across different companies/sources that happen to share a domain — and
@@ -189,13 +233,7 @@ def extract_event_datetime(text: str, fallback_date: Optional[str]):
     if event_date is None:
         event_date = fallback_date
 
-    time_match = _TIME_RE.search(text)
-    if time_match:
-        clock = time_match.group(1).strip()
-        event_time = f"{clock} {time_match.group(2)}" if time_match.group(2) else clock
-    else:
-        event_time = None
-    return event_date, event_time
+    return event_date, _parse_clock(text)
 
 
 def _entry_date(entry) -> Optional[str]:
@@ -366,16 +404,33 @@ def resolve_cik(session: requests.Session, cfg: dict, ticker: str) -> Optional[s
 #     future. Getting this wrong would put a wrong date on the page with
 #     the same confidence as a verified filing fact, which is worse than
 #     just not showing it.
-_SCHEDULE_ITEM_CODES = {"2.02", "7.01"}
+_SCHEDULE_ITEM_CODES = {"2.02", "7.01", "8.01"}
+# A proxy statement has no 8-K item code, but it is the single most reliable
+# forward-looking filing there is: every US company files one ahead of its
+# annual meeting, and it opens by stating exactly when and where that
+# meeting will be held ("...will be held on May 15, 2027 at 9:00 a.m.
+# Eastern Time"). Filed further ahead of the event than an earnings 8-K, so
+# it gets a longer lookback than the item-code forms.
+_SCHEDULE_FORMS = {"DEF 14A", "DEFA14A"}
 _SCHEDULE_LOOKBACK_DAYS = 30
-_SCHEDULE_MAX_FUTURE_DAYS = 180
+_SCHEDULE_PROXY_LOOKBACK_DAYS = 120
+_SCHEDULE_MAX_FUTURE_DAYS = 300
 _SCHEDULE_TEXT_CAP = 20000
 _SCHEDULE_KEYWORDS_RE = re.compile(
     r"\b(conference\s+call|webcast|earnings\s+call|investor\s+day|"
-    r"analyst\s+day|capital\s+markets?\s+day)\b", re.IGNORECASE)
+    r"analyst\s+day|capital\s+markets?\s+day|"
+    r"annual\s+meeting(?:\s+of\s+(?:the\s+)?(?:share|stock)holders)?|"
+    r"special\s+meeting(?:\s+of\s+(?:the\s+)?(?:share|stock)holders)?|"
+    r"extraordinary\s+general\s+meeting|annual\s+general\s+meeting)\b",
+    re.IGNORECASE)
 
 
-def _find_scheduled_date(doc_text: str, today: date) -> Optional[tuple[str, str]]:
+def _find_scheduled_date(doc_text: str, today: date) -> Optional[tuple[str, str, Optional[str]]]:
+    """Returns (date, matched keyword, time-of-day or None). The time is read
+    from the same window as the date rather than the whole document, since a
+    filing that says "call on August 25, 2026 at 8:30 a.m. ET" states both
+    together — searching the whole text would happily pair the date with a
+    clock from some unrelated paragraph."""
     text = doc_text[:_SCHEDULE_TEXT_CAP]
     for pattern in DATE_PHRASE_PATTERNS:
         for m in pattern.finditer(text):
@@ -390,7 +445,10 @@ def _find_scheduled_date(doc_text: str, today: date) -> Optional[tuple[str, str]
                 continue
             found = dt.date()
             if today < found <= today + timedelta(days=_SCHEDULE_MAX_FUTURE_DAYS):
-                return found.isoformat(), kw.group(0)
+                # Look just after the date phrase first ("...on Aug 25, 2026
+                # at 8:30 a.m. ET"), then the wider window.
+                after = text[m.end(): m.end() + 120]
+                return found.isoformat(), kw.group(0), _parse_clock(after) or _parse_clock(window)
     return None
 
 
@@ -427,11 +485,14 @@ def _find_exhibit_urls(session: requests.Session, cfg: dict, cik: str, accn_noda
 def _fetch_scheduled_event(session: requests.Session, cfg: dict, company: dict, cik: str,
                             accn_nodash: str, filing_url: str, form: str, fdate: str,
                             item_code: str) -> Optional[RawItem]:
-    if fdate < (date.today() - timedelta(days=_SCHEDULE_LOOKBACK_DAYS)).isoformat():
+    is_proxy = form in _SCHEDULE_FORMS
+    lookback = _SCHEDULE_PROXY_LOOKBACK_DAYS if is_proxy else _SCHEDULE_LOOKBACK_DAYS
+    if fdate < (date.today() - timedelta(days=lookback)).isoformat():
         return None
-    codes = {c.strip() for c in item_code.split(",")} if item_code else set()
-    if not codes & _SCHEDULE_ITEM_CODES:
-        return None
+    if not is_proxy:
+        codes = {c.strip() for c in item_code.split(",")} if item_code else set()
+        if not codes & _SCHEDULE_ITEM_CODES:
+            return None
     # Check the cover page first (cheap — already have the URL, no extra
     # index lookup), then fall back to the press-release exhibit only if
     # that comes up empty, since most filings have one and it's where this
@@ -446,14 +507,14 @@ def _fetch_scheduled_event(session: requests.Session, cfg: dict, company: dict, 
         except Exception:
             found = None
         if found:
-            sched_date, keyword = found
+            sched_date, keyword, sched_time = found
             return RawItem(
                 ticker=company["ticker"], company_name=company["name"],
                 country=company.get("country", ""), region=company.get("region", ""),
                 exchange=company.get("exchange", ""),
                 source_type="sec_edgar", tier="regulatory",
                 title=f"{company['name']}: {keyword.title()} scheduled",
-                link=doc_url, published=sched_date, published_time=None,
+                link=doc_url, published=sched_date, published_time=sched_time,
                 summary=f"Found in {form} filed {fdate}.", publisher="sec.gov",
                 # Deliberately no sec_item here, unlike the filing-fact item
                 # above: setting it would make classify() bypass keyword

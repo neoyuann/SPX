@@ -201,7 +201,7 @@ classifier:
         - ['\bearnings\s+(call|conference\s+call|webcast)\b', 4.0]
         - ['\b(q[1-4]|first|second|third|fourth)[\s-]*quarter.*\bcall\b', 3.5]
         - ['\bconference\s+call\b', 2.0]
-        - ['\bwebcast\b', 1.5]
+        - ['\bwebcast\b', 2.0]
         - ['\bdial[- ]?in\b', 1.5]
 
     earnings_release:
@@ -299,6 +299,11 @@ classifier:
         - ['\b(annual|extraordinary|special)\s+general\s+meeting\b', 5.0]
         - ['\b(AGM|EGM|SGM)\b', 4.5]
         - ['\bshareholders?\s+meeting\b', 4.5]
+        # US proxy statements phrase it this way rather than "general
+        # meeting" — without these, a DEF 14A's "Annual Meeting of
+        # Stockholders" scored 0 and the event was dropped outright.
+        - ['\b(annual|special)\s+meeting\s+of\s+(share|stock)holders\b', 5.0]
+        - ['\bannual\s+meeting\b', 2.5]
         - ['\bproxy\s+statement\b', 3.5]
         - ['\bnotice\s+of\s+meeting\b', 3.5]
         - ['\bvoting\s+results?\b', 3.0]
