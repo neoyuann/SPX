@@ -108,7 +108,8 @@ def _group_into_events(classified: list, cfg: dict) -> list[dict]:
             cluster.sort(key=lambda ci: tier_priority(ci.raw.tier))
             primary = cluster[0]
             summary = next((c.raw.summary for c in cluster if c.raw.summary), "")[:400]
-            eid = event_id(ticker, category, primary.raw.published, primary.raw.title)
+            eid = event_id(ticker, category, primary.raw.published, primary.raw.title,
+                            date_is_fact=primary.raw.date_is_fact)
             chash = content_hash(primary.raw.title, category, primary.raw.published,
                                   primary.raw.published_time, summary)
             event = {

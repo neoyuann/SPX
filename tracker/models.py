@@ -66,6 +66,13 @@ class RawItem:
     summary: str = ""
     publisher: str = ""       # domain or feed name, for display
     sec_item: Optional[str] = None    # 8-K item code, if this came from EDGAR
+    # True when `published` is a historical fact that cannot be revised — a
+    # filing's filing date, above all. False for anything whose date is a
+    # plan that may move (a scheduled call, a meeting) or an estimate (a
+    # news item's publish date standing in for an unstated event date).
+    # event_id() keys on the exact date for facts and on the calendar year
+    # for the rest; see the note there for why the two differ.
+    date_is_fact: bool = False
 
 
 @dataclass
@@ -91,7 +98,8 @@ def canonical_url(url: str) -> str:
     return base.rstrip("/")
 
 
-def event_id(ticker: str, category: str, event_date: Optional[str], title: str) -> str:
+def event_id(ticker: str, category: str, event_date: Optional[str], title: str,
+              date_is_fact: bool = False) -> str:
     """Stable id for an event grouping.
 
     Deliberately excludes the *exact* date. A scheduled date correction is
@@ -116,12 +124,21 @@ def event_id(ticker: str, category: str, event_date: Optional[str], title: str) 
     some IR headlines spell the date out ("...on 12 November 2026"), and a
     corrected headline otherwise differs from the old one in exactly the
     text this function is trying to make date-corrections ignore.
+
+    When date_is_fact is set, the *exact* date is keyed on instead. A
+    filing's filing date is history, not a plan — it cannot be revised, so
+    there is no date-correction to preserve, and the year bucket actively
+    destroys data for these: SEC filing titles are generated from the form
+    and its item codes ("CATERPILLAR INC files 8-K — items 2.02,7.01,9.01"),
+    so every quarterly earnings 8-K a company files carries an identical
+    title, and bucketing by year collapsed all four of them into a single
+    event. That is why a company could show one filing for a whole year.
     """
     title_no_date = strip_date_phrases(title)
     norm_title = "".join(ch.lower() for ch in title_no_date if ch.isalnum() or ch.isspace())
     norm_title = " ".join(norm_title.split())[:60]
-    year_bucket = (event_date or "")[:4] or "undated"
-    key = f"{ticker}|{category}|{year_bucket}|{norm_title}"
+    date_key = (event_date or "undated") if date_is_fact else ((event_date or "")[:4] or "undated")
+    key = f"{ticker}|{category}|{date_key}|{norm_title}"
     return hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
 
 

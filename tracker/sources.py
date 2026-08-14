@@ -615,6 +615,19 @@ def _fetch_scheduled_event(session: requests.Session, cfg: dict, company: dict, 
     return None
 
 
+def _filing_rows(block: dict) -> list[tuple]:
+    """Flatten one submissions block (the "recent" object, or an older shard
+    file, which uses the same column-arrays shape) into per-filing tuples."""
+    forms = block.get("form", []) or []
+    return list(zip(
+        forms,
+        block.get("filingDate", []) or [],
+        block.get("accessionNumber", []) or [],
+        block.get("items", [""] * len(forms)) or [""] * len(forms),
+        block.get("primaryDocument", [""] * len(forms)) or [""] * len(forms),
+    ))
+
+
 def fetch_sec_edgar(source: dict, company: dict, cfg: dict, session: requests.Session) -> list[RawItem]:
     cik = str(source.get("cik") or "").strip()
     if cik:
@@ -629,18 +642,36 @@ def fetch_sec_edgar(source: dict, company: dict, cfg: dict, session: requests.Se
     r = _get(session, url, cfg)
     r.raise_for_status()
     data = r.json()
-    recent = (data.get("filings") or {}).get("recent") or {}
-    forms = recent.get("form", [])
-    dates = recent.get("filingDate", [])
-    accns = recent.get("accessionNumber", [])
-    items_field = recent.get("items", [""] * len(forms))
-    primary_docs = recent.get("primaryDocument", [""] * len(forms))
-
+    filings = data.get("filings") or {}
     history_from = cfg.get("run", {}).get("history_from")
+
+    # "recent" holds only the latest slice of a company's filing history —
+    # roughly the last thousand filings — and everything older lives in
+    # separate shard files that this never read. For an active filer that
+    # slice can cover as little as a year or two, which is why history
+    # thinned out sharply the further back you looked (64 events stored for
+    # 2020 against 6,678 for 2025) even though history_from asked for 2020.
+    # Each shard declares the date range it covers, so only the ones that
+    # actually overlap the requested window are fetched.
+    rows = _filing_rows(filings.get("recent") or {})
+    for shard in (filings.get("files") or []):
+        if history_from and str(shard.get("filingTo", "")) < history_from:
+            continue
+        name = str(shard.get("name", "")).strip()
+        if not name:
+            continue
+        try:
+            sr = _get(session, f"https://data.sec.gov/submissions/{name}", cfg)
+            sr.raise_for_status()
+            rows.extend(_filing_rows(sr.json()))
+        except Exception:
+            # One unreadable shard shouldn't cost the company its recent
+            # filings, which are already gathered above.
+            continue
+
     max_items = int(cfg.get("run", {}).get("max_items_per_source", 250))
     items = []
-    for form, fdate, accn, item_code, primary_doc in list(
-            zip(forms, dates, accns, items_field, primary_docs))[:max_items]:
+    for form, fdate, accn, item_code, primary_doc in rows[:max_items]:
         if history_from and fdate < history_from:
             continue
         if form not in _SEC_FORM_HINT:
@@ -660,6 +691,11 @@ def fetch_sec_edgar(source: dict, company: dict, cfg: dict, session: requests.Se
             title=title, link=filing_url, published=fdate, published_time=None,
             summary=f"SEC form {form} filed {fdate}.", publisher="sec.gov",
             sec_item=item_code or None,
+            # The filing date is a matter of record and never moves, and
+            # these titles repeat verbatim across a year's filings — so the
+            # exact date, not the year, is what makes each filing its own
+            # event. See event_id().
+            date_is_fact=True,
         ))
         scheduled = _fetch_scheduled_event(session, cfg, company, cik, accn_nodash,
                                             filing_url, form, fdate, item_code)
