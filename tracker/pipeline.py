@@ -196,6 +196,25 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
             if s.get("type") == "news" and not news_enabled:
                 continue
             all_sources.append((c, s))
+
+    # Fetch the sources that actually produce events before the ones that
+    # merely corroborate them. Every company carries a `news` source, and
+    # they all queue behind one host's politeness delay, so in roster order
+    # news alone can consume an entire run's budget: 2,883 of them at 0.4s
+    # is ~19 minutes of a 20-minute budget, which starved the filings that
+    # the page is mostly built from (sec_edgar's 1,247 sources share a much
+    # faster delay and finish in ~2.5 minutes). Measured effect of that
+    # starvation: a run reached ~30% of the roster and only 402 of 2,883
+    # companies had ever produced a single event.
+    #
+    # Ordering by tier fixes it without dropping news: regulatory and
+    # company-own sources go first and comfortably finish, news fills
+    # whatever budget is left, and when the budget runs out it's news that
+    # gets cut — the source we can most afford to lose, and the one whose
+    # coverage still rotates because the shuffle above is preserved within
+    # each band.
+    _SOURCE_PRIORITY = {"sec_edgar": 0, "ir_page": 1, "rss": 2, "news": 3}
+    all_sources.sort(key=lambda cs: _SOURCE_PRIORITY.get(cs[1].get("type"), 2))
     total = len(all_sources)
 
     store = Store(cfg["output"]["db_path"])
@@ -260,9 +279,9 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
                 classified_items.extend(classified)
     except TimeoutError:
         out_of_time = True
-        for future, (c, _s) in futures.items():
+        for future, (c, s) in futures.items():
             if not future.done():
-                skipped_companies.append(c["ticker"])
+                skipped_companies.append((c["ticker"], s.get("type", "?")))
         # Don't wait for whatever's still running — their own request_timeout
         # bounds how much longer that can be, and a background refresh
         # cycle running a bit long in the background is a fine trade for
@@ -274,6 +293,15 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
     if out_of_time:
         with progress_lock:
             skipped_companies = sorted(set(skipped_companies))
+    # Summarised by source type rather than listed ticker by ticker. Sources
+    # are fetched in tier order now (filings first, news last), so a run that
+    # runs long cuts news for most of the roster — listing every one of those
+    # tickers made the note thousands of characters long and read as though
+    # those companies had been missed entirely, when their filings were in
+    # fact fetched. What matters is which *kinds* of source got cut.
+    skipped_by_type: dict[str, int] = {}
+    for _ticker, stype in skipped_companies:
+        skipped_by_type[stype] = skipped_by_type.get(stype, 0) + 1
 
     grouped = _group_into_events(classified_items, cfg)
 
@@ -375,8 +403,9 @@ def run(config_path: str, companies_path: str, *, verbose: bool = False,
              f"events, {link_check_failed} failed their link check, "
              f"{link_check_skipped} kept unverified (link check ran long), {len(kept)} kept")
     notes = stats
-    if out_of_time and skipped_companies:
-        notes += "; ran out of time, skipped: " + ", ".join(sorted(set(skipped_companies)))
+    if out_of_time and skipped_by_type:
+        notes += "; ran out of time, skipped " + ", ".join(
+            f"{n} {stype}" for stype, n in sorted(skipped_by_type.items(), key=lambda kv: -kv[1]))
     store.finish_run(run_id, ok=True, companies=len(companies), sources=total,
                       new_count=new_count, changed_count=changed_count, notes=notes)
     store.close()
