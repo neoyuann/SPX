@@ -22,7 +22,15 @@ concurrency:
 
 jobs:
   apply:
-    if: contains(github.event.issue.labels.*.name, 'roster')
+    # Matched on the title prefix as well as the label, not the label alone.
+    # An issue form can only apply a label that already exists in the repo —
+    # a `labels:` entry naming one that doesn't is dropped silently — so
+    # gating solely on the label meant the very first real request sat
+    # unprocessed with no error anywhere. The title prefix is set by the
+    # form itself and can't go missing the same way.
+    if: >-
+      contains(github.event.issue.labels.*.name, 'roster') ||
+      startsWith(github.event.issue.title, '[roster]')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:

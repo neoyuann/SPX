@@ -37206,3 +37206,12 @@ companies:
         tier: regulatory
       - type: news
         tier: news
+
+  - ticker: "9987.HK"
+    name: "Yum China"
+    exchange: "HKEX"
+    country: "Hong Kong"
+    enabled: true
+    sources:
+      - type: news
+        tier: news
