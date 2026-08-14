@@ -446,8 +446,33 @@ _SCHEDULE_NEGATIVE_RE = re.compile(
     # the two that actually produced wrong entries — several meetings were
     # stored as 31 December, which is a year end, not a meeting.
     r"fiscal\s+year|year\s+end(?:ing|ed)?|record\s+date|"
-    r"(?:holders?|shareholders?|stockholders?)\s+of\s+record|as\s+of\s+the\s+close)\b",
+    r"(?:holders?|shareholders?|stockholders?)\s+of\s+record|as\s+of\s+the\s+close|"
+    # Proxy voting deadlines. A proxy statement says votes "must be received
+    # by 11:59 p.m. Eastern Time on September 21, 2026" — the day before the
+    # meeting it refers to — which was being stored as the meeting itself,
+    # producing a duplicate event dated a day early and timed 11:59 p.m.
+    r"must\s+be\s+received|received\s+by|submitted\s+by|deadline|cut[-\s]?off|"
+    r"vote\s+(?:your|by)|voting\s+instructions?|proxy\s+card)\b",
     re.IGNORECASE)
+
+# No shareholder meeting, earnings call or investor day starts late at night.
+# A clock in these hours is a deadline or a boilerplate cut-off that slipped
+# past the wording checks above, and it discredits the date it sits with —
+# so the whole candidate is dropped, not just its time.
+_IMPLAUSIBLE_EVENT_HOURS = set(range(22, 24)) | set(range(0, 5))
+
+
+def _clock_hour24(clock: str) -> Optional[int]:
+    m = re.match(r"(\d{1,2}):(\d{2})\s*(am|pm)?", clock or "", re.IGNORECASE)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    meridiem = (m.group(3) or "").lower()
+    if meridiem == "pm" and hour != 12:
+        hour += 12
+    elif meridiem == "am" and hour == 12:
+        hour = 0
+    return hour
 
 # Sentence-ish split. The "p.m." in "6:00 p.m. Eastern Daylight Time,
 # Monday, August 10, 2026" is not a sentence end, and treating it as one
@@ -497,6 +522,9 @@ def _find_scheduled_date(doc_text: str, today: date) -> Optional[tuple[str, str,
                 # fall back to the sentence's own zone when the clock didn't
                 # carry one.
                 clock = _parse_clock(sentence[m.end():]) or _parse_clock(sentence)
+                hour = _clock_hour24(clock) if clock else None
+                if hour is not None and hour in _IMPLAUSIBLE_EVENT_HOURS:
+                    return None
                 if clock and not re.search(rf"({_TZ_NAMES})\b|{_TZ_WORDS}", clock, re.IGNORECASE):
                     zone = re.search(rf"\b({_TZ_NAMES})\b|\b({_TZ_WORDS})", sentence, re.IGNORECASE)
                     if zone:
