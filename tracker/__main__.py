@@ -7,7 +7,7 @@ import sys
 
 from .addco import add_company, list_companies
 from .pipeline import load_yaml, run as run_pipeline
-from .render import build_payload, page_html
+from .render import build_payload, page_html, write_site
 from .sources import link_is_alive, make_session
 
 
@@ -99,12 +99,12 @@ def cmd_run(args):
                            only_ticker=args.ticker, no_news=args.no_news)
     cfg = load_yaml(args.config)
     roster = load_yaml(args.companies)
-    events, meta = build_payload(cfg, roster)
-    out_path = cfg["output"]["html_path"]
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(page_html(events, meta, live=False))
-    print(f"Wrote {out_path}")
+    # Writes index.html plus one events-<year>.json per earlier year; the
+    # page pulls those in only when a filter reaches back that far. See
+    # render.write_site for why the history can't all live in the page.
+    site_dir = os.path.dirname(cfg["output"]["html_path"]) or "out"
+    index_path = write_site(cfg, roster, site_dir)
+    print(f"Wrote {index_path}")
 
     # Everything that matters — every store write, the page itself — has
     # already happened synchronously above. Exit immediately rather than
@@ -127,12 +127,8 @@ def cmd_run(args):
 def cmd_render(args):
     cfg = load_yaml(args.config)
     roster = load_yaml(args.companies)
-    events, meta = build_payload(cfg, roster)
-    out_path = cfg["output"]["html_path"]
-    os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
-    with open(out_path, "w", encoding="utf-8") as fh:
-        fh.write(page_html(events, meta, live=False))
-    print(f"Wrote {out_path}")
+    site_dir = os.path.dirname(cfg["output"]["html_path"]) or "out"
+    print(f"Wrote {write_site(cfg, roster, site_dir)}")
 
 
 def main():

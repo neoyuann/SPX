@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 venv/
 data/*.db-journal
-out/dashboard.html
+out/
+
 *.log
 .DS_Store

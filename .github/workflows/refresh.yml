@@ -100,7 +100,12 @@ jobs:
       - name: Prepare Pages artifact
         run: |
           mkdir -p _site
-          cp out/dashboard.html _site/index.html
+          # index.html plus the per-year history files it fetches on demand
+          # (see render.write_site) — copying only the page would leave those
+          # requests 404ing the moment someone widens the date filter.
+          cp out/index.html _site/index.html
+          cp out/events-*.json _site/ 2>/dev/null || true
+          ls -lh _site | head -20
 
       - uses: actions/upload-pages-artifact@v3
         with:

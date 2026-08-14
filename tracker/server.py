@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 import webbrowser
@@ -26,7 +27,7 @@ from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .pipeline import run as run_pipeline, load_yaml
-from .render import _to_sgt, build_payload, page_html
+from .render import _to_sgt, build_payload, page_html, split_payload
 from .store import Store
 
 
@@ -47,6 +48,9 @@ def parse_utc(value):
     except Exception:
         return None
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+_YEAR_FILE_RE = re.compile(r"^/events-(\d{4})\.json$")
 
 
 class RefreshManager:
@@ -228,8 +232,22 @@ class Handler(BaseHTTPRequestHandler):
             # the page always just renders whatever's already in the
             # database, instantly — keeping that current is background_
             # scheduler's job, running independently of anyone looking.
+            # Same split as the published page: only recent history goes
+            # into the document, the rest is fetched per year from the route
+            # below. A full roster's history is ~100MB of JSON — inlining it
+            # would make every page view unusable, server or not.
             events, meta = build_payload(m.cfg(), m.roster())
-            self._send(200, page_html(events, meta, live=True), "text/html; charset=utf-8")
+            inline, by_year, inline_from = split_payload(events)
+            meta["inline_from"] = inline_from
+            meta["lazy_years"] = sorted(by_year)
+            meta["total_events"] = len(events)
+            self._send(200, page_html(inline, meta, live=True), "text/html; charset=utf-8")
+
+        elif _YEAR_FILE_RE.match(path):
+            year = _YEAR_FILE_RE.match(path).group(1)
+            events, _meta = build_payload(m.cfg(), m.roster())
+            _inline, by_year, _from = split_payload(events)
+            self._send(200, json.dumps(by_year.get(year, [])), "application/json")
 
         elif path == "/api/ping":
             # A dedicated, trivial route the page checks once on load so it

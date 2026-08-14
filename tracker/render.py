@@ -11,6 +11,21 @@ from datetime import datetime, timedelta, timezone
 
 from .store import Store
 
+# Per-event caps on the drawer-only fields. See the note in build_payload:
+# these are embedded once per event, so they set the page's floor size.
+_MAX_SOURCES_SHOWN = 6
+_MAX_CHANGES_SHOWN = 5
+
+# How much history ships inside the page itself. Everything older is written
+# beside it as one file per year and fetched only when a filter actually
+# reaches back that far. Without this the page carried every event it had —
+# which, once history genuinely went back to 2020, meant a 104MB document
+# that no browser would open, so the fuller history made the page useless
+# rather than better. A visitor almost always wants what's coming up and
+# what just happened; that arrives immediately, and the rest arrives when
+# it's asked for.
+_INLINE_PAST_DAYS = 120
+
 SGT = timezone(timedelta(hours=8))
 
 
@@ -52,19 +67,32 @@ def build_payload(cfg: dict, roster: dict) -> tuple[list, dict]:
         events.append({
             "id": e["id"], "ticker": e["ticker"], "company": e["company_name"],
             "category": e["category"], "label": e["label"], "headline": e["headline"],
-            "summary": e.get("summary", ""), "event_date": e.get("event_date"),
+            "summary": (e.get("summary") or "")[:240], "event_date": e.get("event_date"),
             "event_time": e.get("event_time"),
             "country": company.get("country") or e.get("country") or "Other",
             "sub_sector": company.get("sub_sector") or "Unclassified",
             "region": e.get("region"), "exchange": e.get("exchange"), "tier": e.get("tier"),
-            "primary_url": e.get("primary_url"), "sources": e.get("sources", []),
-            "matched_on": e.get("matched_on", []), "status": e.get("status"),
+            "primary_url": e.get("primary_url"),
+            # Bounded on purpose. Every one of these fields is embedded in the
+            # page for every event, and once history reached back to 2020 that
+            # was a 104MB document — unopenable, whatever else was right about
+            # it. The list view only reads the count of sources; the rest is
+            # drawer detail, so it's capped at what a drawer actually shows
+            # rather than carried in full for a hundred thousand events.
+            "sources": [
+                {"url": s.get("url"), "tier": s.get("tier"),
+                 "title": (s.get("title") or "")[:140], "publisher": s.get("publisher")}
+                for s in (e.get("sources") or [])[:_MAX_SOURCES_SHOWN]
+            ],
+            "n_sources": len(e.get("sources") or []),
+            "matched_on": [m[:60] for m in (e.get("matched_on") or [])[:6]],
+            "status": e.get("status"),
             "prev_event_date": e.get("prev_event_date"),
             "first_seen_sgt": _to_sgt(e.get("first_seen")),
             "last_seen_sgt": _to_sgt(e.get("last_seen")),
             "change_history": [
                 {**c, "changed_at_sgt": _to_sgt(c.get("changed_at"))}
-                for c in e.get("change_history", [])
+                for c in (e.get("change_history") or [])[-_MAX_CHANGES_SHOWN:]
             ],
         })
 
@@ -94,6 +122,44 @@ def build_payload(cfg: dict, roster: dict) -> tuple[list, dict]:
         "repo_slug": os.environ.get("GITHUB_REPOSITORY", ""),
     }
     return events, meta
+
+
+def split_payload(events: list, inline_past_days: int = _INLINE_PAST_DAYS) -> tuple[list, dict, str]:
+    """Split events into (inline, {year: events}, inline_from).
+
+    Inline gets everything from inline_from onward — the upcoming events and
+    the recent past a visitor is nearly always after. Older events are
+    bucketed by calendar year so a date filter reaching back can fetch just
+    the years it needs.
+    """
+    inline_from = (datetime.now(timezone.utc) - timedelta(days=inline_past_days)).date().isoformat()
+    inline, by_year = [], {}
+    for e in events:
+        d = e.get("event_date")
+        if not d or d >= inline_from:
+            inline.append(e)
+        else:
+            by_year.setdefault(d[:4], []).append(e)
+    return inline, by_year, inline_from
+
+
+def write_site(cfg: dict, roster: dict, out_dir: str) -> str:
+    """Write the published page and its lazily-fetched history files."""
+    events, meta = build_payload(cfg, roster)
+    inline, by_year, inline_from = split_payload(events)
+    meta["inline_from"] = inline_from
+    meta["lazy_years"] = sorted(by_year)
+    meta["total_events"] = len(events)
+
+    os.makedirs(out_dir, exist_ok=True)
+    for year, chunk in by_year.items():
+        with open(os.path.join(out_dir, f"events-{year}.json"), "w", encoding="utf-8") as fh:
+            json.dump(chunk, fh, ensure_ascii=False, separators=(",", ":"))
+
+    index_path = os.path.join(out_dir, "index.html")
+    with open(index_path, "w", encoding="utf-8") as fh:
+        fh.write(page_html(inline, meta, live=False))
+    return index_path
 
 
 # ---------------------------------------------------------------------------
@@ -299,6 +365,7 @@ def page_html(events: list, meta: dict, live: bool = True) -> str:
   <div class="strip" id="strip"></div>
 
   <div id="upcomingSection"></div>
+  <div class="empty" id="historyNote" style="display:none"></div>
   <div id="pastSection"></div>
 </div>
 
@@ -337,7 +404,7 @@ def page_html(events: list, meta: dict, live: bool = True) -> str:
 
 <script>
 const LIVE = {str(live).lower()};
-const EVENTS = {events_json};
+let EVENTS = {events_json};
 const META = {meta_json};
 {_JS}
 </script>
@@ -347,7 +414,8 @@ const META = {meta_json};
 _JS = r"""
 const TIER_LABEL = {regulatory:'Regulatory', company_ir:'Company IR', newswire:'Newswire', news:'News'};
 let state = { categories: new Set(META.categories.map(c=>c.key)), search:'', country:'', subSector:'',
-              from:'', to:'', changedOnly:false, newOnly:false, showPast:true };
+              from:'', to:'', changedOnly:false, newOnly:false, showPast:true,
+              allTime:false };
 let liveOk = false;
 
 function fmtDate(d){ if(!d) return null; return d; }
@@ -396,6 +464,57 @@ function applyFilters(list){
   });
 }
 
+// -- Lazy history ------------------------------------------------------
+// Only recent events ship inside the page; earlier years sit beside it as
+// one file per year (see render.write_site) and are pulled in the moment a
+// filter actually reaches back that far, so the common case stays instant.
+const PAST_RENDER_CAP = 400;
+const loadedYears = new Set();
+let loadingHistory = false;
+
+function yearsNeeded(){
+  const avail = META.lazy_years || [];
+  if(!avail.length) return [];
+  // A search or an explicit date range should look across everything; the
+  // default view deliberately doesn't.
+  const wantAll = !!state.search || state.allTime;
+  const from = state.from || null;
+  return avail.filter(y=>{
+    if(loadedYears.has(y)) return false;
+    if(wantAll) return true;
+    return from ? y >= from.slice(0,4) : false;
+  });
+}
+
+function historyNote(msg){
+  const el = document.getElementById('historyNote');
+  if(el){ el.textContent = msg || ''; el.style.display = msg ? 'block' : 'none'; }
+}
+
+async function ensureHistory(){
+  const need = yearsNeeded();
+  if(!need.length || loadingHistory) return;
+  loadingHistory = true;
+  historyNote(`Loading ${need.length === 1 ? need[0] : need.length + ' earlier years'}…`);
+  for(const y of need){
+    try{
+      const r = await fetch(`events-${y}.json`);
+      if(!r.ok) throw new Error(r.status);
+      const chunk = await r.json();
+      const seen = new Set(EVENTS.map(e=>e.id));
+      EVENTS = EVENTS.concat(chunk.filter(e=>!seen.has(e.id)));
+      loadedYears.add(y);
+    }catch(err){
+      historyNote(`Couldn't load ${y}.`);
+      loadingHistory = false;
+      return;
+    }
+  }
+  loadingHistory = false;
+  historyNote('');
+  render();
+}
+
 function computeSummary(){
   const today = todayStr();
   const in7 = new Date(Date.now()+7*86400000).toISOString().slice(0,10);
@@ -433,7 +552,7 @@ function cardHtml(e){
     ? `<div class="d">${e.event_date}</div><span class="t">${e.event_time || (e.event_date < todayStr() ? 'NA' : 'TIME TBC')}</span>`
     : `<div class="d">—</div><span class="t">NA</span>`;
   const delta = e.status==='date_moved' && e.prev_event_date ? `<div class="card-delta">was ${e.prev_event_date}</div>` : '';
-  const srcCount = e.sources.length>1 ? `<div class="card-src">+${e.sources.length-1} source${e.sources.length>2?'s':''}</div>` : '';
+  const srcCount = (e.n_sources||e.sources.length)>1 ? `<div class="card-src">+${(e.n_sources||e.sources.length)-1} source${(e.n_sources||e.sources.length)>2?"s":""}</div>` : "";
   const newDot = e.status==='new' ? '<span class="card-newdot"></span>' : '';
   return `<div class="card ${railClass(e)} ${e.status==='date_moved'?'date_moved':''}" data-id="${e.id}">
     <div class="card-top"><span class="card-cat">${e.label}</span>${newDot}</div>
@@ -459,6 +578,7 @@ function groupByCountry(list){
 }
 
 function render(){
+  ensureHistory();      // pulls in earlier years if the filters now need them
   renderSummary();
   const today = todayStr();
   const filtered = applyFilters(EVENTS);
@@ -487,9 +607,17 @@ function render(){
        <div class="cards">${list.map(cardHtml).join('')}</div></div>`).join('')
      : '<div class="empty">No upcoming events match the current filters.</div>');
 
+  // Past is capped before it reaches the DOM. History back to 2020 means a
+  // loose filter can select tens of thousands of events, and building a card
+  // for every one locks the tab up for however long that takes — the count
+  // in the heading stays truthful, only the drawing is bounded.
   const pastEl = document.getElementById('pastSection');
-  pastEl.innerHTML = state.showPast ? (`<div class="section-title">Past <span class="section-count">(${past.length})</span></div>` +
-    (past.length ? groupByCountry(past).map(([country, list])=>
+  const pastShown = past.slice(0, PAST_RENDER_CAP);
+  const pastNote = past.length > PAST_RENDER_CAP
+    ? `<div class="empty">Showing the ${PAST_RENDER_CAP.toLocaleString()} most recent of ${past.length.toLocaleString()} matching past events — narrow the filters or set a date range to see further back.</div>`
+    : '';
+  pastEl.innerHTML = state.showPast ? (`<div class="section-title">Past <span class="section-count">(${past.length.toLocaleString()})</span></div>` +
+    (past.length ? pastNote + groupByCountry(pastShown).map(([country, list])=>
       `<div class="country-group"><div class="country-name">${escapeHtml(country)}</div>
        <div class="cards">${list.map(cardHtml).join('')}</div></div>`).join('')
      : '<div class="empty">No past events match the current filters.</div>')) : '';
@@ -567,6 +695,7 @@ document.querySelectorAll('[data-preset]').forEach(b=>{
     else if(p==='quarter'){ const q=Math.floor(today.getMonth()/3); const start=new Date(today.getFullYear(), q*3, 1); const end=new Date(today.getFullYear(), q*3+3, 0);
       state.from=fmt(start); state.to=fmt(end); }
     else { state.from=''; state.to=''; }
+    state.allTime = (p === 'all');
     document.getElementById('fromDate').value = state.from;
     document.getElementById('toDate').value = state.to;
     render();
