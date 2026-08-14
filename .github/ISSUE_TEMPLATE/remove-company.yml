@@ -1,0 +1,32 @@
+name: Remove or pause a tracked company
+description: Stop tracking a company, or pause it without losing its history. Submitted from the dashboard's "Add / remove companies" panel.
+title: "[roster] remove "
+labels: ["roster"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Submit this and the roster updates automatically — the change appears
+        on the dashboard after the next hourly refresh.
+
+        Past events already collected are never deleted either way. Pausing
+        just stops new ones being gathered, and can be undone by submitting
+        this form again.
+  - type: input
+    id: ticker
+    attributes:
+      label: Ticker
+      description: Exactly as it appears in the dashboard's company list.
+      placeholder: 2330.TW
+    validations:
+      required: true
+  - type: dropdown
+    id: action
+    attributes:
+      label: What should happen
+      options:
+        - Remove
+        - Pause or resume
+      default: 0
+    validations:
+      required: true

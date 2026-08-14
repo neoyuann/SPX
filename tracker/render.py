@@ -6,6 +6,7 @@ single self-contained interactive HTML page. Used by both the live server
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 from .store import Store
@@ -86,6 +87,11 @@ def build_payload(cfg: dict, roster: dict) -> tuple[list, dict]:
         "change_window_days": int(cfg.get("output", {}).get("change_window_days", 14)),
         "last_run_sgt": _to_sgt(last_run.get("finished_at")),
         "generated_at_sgt": datetime.now(SGT).strftime("%Y-%m-%d %H:%M"),
+        # Lets the published page point its "add / remove companies" controls
+        # at this repo's issue forms, which is how roster changes get made
+        # when there's no server behind the page. GitHub Actions sets
+        # GITHUB_REPOSITORY; empty elsewhere, and the panel adapts.
+        "repo_slug": os.environ.get("GITHUB_REPOSITORY", ""),
     }
     return events, meta
 
@@ -220,13 +226,31 @@ def page_html(events: list, meta: dict, live: bool = True) -> str:
     events_json = json.dumps(events, ensure_ascii=False).replace("</script", "<\\/script")
     meta_json = json.dumps(meta, ensure_ascii=False).replace("</script", "<\\/script")
     history_from = meta.get("history_from") or "2020-01-01"
-    static_note = (
-        '<div class="static-note">This is a static export. '
-        '<b>Refresh now</b> and the company panel need <code>python -m tracker serve</code> '
-        'running — open the live tracker for those.</div>'
-        if not live else ""
-    )
     n_companies = len({c["ticker"] for c in meta.get("companies", [])})
+    repo = meta.get("repo_slug") or ""
+    # On the published (static) page there is no server behind the page, so
+    # the two buttons that need one are not rendered at all rather than
+    # rendered-and-then-apologising: "Refresh now" can't trigger anything
+    # (the schedule does that on its own), and History needs a live query.
+    # The refresh time those controls were there to explain is shown
+    # directly instead. Managing companies still works without a server —
+    # it goes through the repo (see the panel), not a local process.
+    if live:
+        header_controls = (
+            '<a class="btn small" id="historyBtn" href="#">History</a>'
+            '<button class="btn small" id="companiesBtn">+ Add / remove companies</button>'
+            '<button class="btn primary small" id="refreshBtn">Refresh now</button>'
+        )
+    else:
+        header_controls = (
+            '<button class="btn small" id="companiesBtn">+ Add / remove companies</button>'
+        )
+    history_panel = ("""<div class="modal-panel" id="historyPanel">
+  <button class="drawer-close" id="historyClose">&times;</button>
+  <h2>Refresh history</h2>
+  <table class="hist-table"><thead><tr><th>Finished (SGT)</th><th>New</th><th>Changed</th><th>Companies</th><th>Notes</th></tr></thead>
+  <tbody id="historyBody"></tbody></table>
+</div>""" if live else "")
     return f"""<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Corporate Event Monitor</title>
@@ -237,13 +261,10 @@ def page_html(events: list, meta: dict, live: bool = True) -> str:
     <p class="subtitle">Tracking {n_companies} companies · official sources only</p></div>
   <div class="spacer"></div>
   <div class="status-line" id="statusLine"><span class="dot" id="statusDot"></span><span id="statusText">Loading…</span></div>
-  <a class="btn small" id="historyBtn" href="#">History</a>
-  <button class="btn small" id="companiesBtn">+ Add / remove companies</button>
-  <button class="btn primary small" id="refreshBtn">Refresh now</button>
+  {header_controls}
 </div></div>
 
 <div class="wrap">
-  {static_note}
   <div class="summary" id="summaryRow"></div>
 
   <div class="filters">
@@ -289,6 +310,9 @@ def page_html(events: list, meta: dict, live: bool = True) -> str:
 <div class="modal-panel" id="companiesPanel">
   <button class="drawer-close" id="companiesClose">&times;</button>
   <h2>Companies</h2>
+  <p id="coRepoNote" style="color:var(--muted);font-size:12px;margin-top:-4px;display:none">
+    Changes here open a short form on GitHub. Once you submit it, the roster updates
+    automatically and the change shows up on this page after the next hourly refresh.</p>
   <input type="text" id="coSearch" class="co-search" placeholder="Filter this list by ticker or name…">
   <div id="companiesList"></div>
   <h2 style="margin-top:22px">Add a company</h2>
@@ -309,12 +333,7 @@ def page_html(events: list, meta: dict, live: bool = True) -> str:
   <button class="btn primary small" id="addCoBtn" style="margin-top:10px">Add company</button>
   <div class="msg" id="addCoMsg"></div>
 </div>
-<div class="modal-panel" id="historyPanel">
-  <button class="drawer-close" id="historyClose">&times;</button>
-  <h2>Refresh history</h2>
-  <table class="hist-table"><thead><tr><th>Finished (SGT)</th><th>New</th><th>Changed</th><th>Companies</th><th>Notes</th></tr></thead>
-  <tbody id="historyBody"></tbody></table>
-</div>
+{history_panel}
 
 <script>
 const LIVE = {str(live).lower()};
@@ -514,7 +533,10 @@ function closeDrawer(){ document.getElementById('overlay').classList.remove('ope
 document.getElementById('drawerClose').onclick = closeDrawer;
 document.getElementById('overlay').onclick = ()=>{ closeDrawer(); closePanel('companiesPanel'); closePanel('historyPanel'); };
 
-function closePanel(id){ document.getElementById(id).classList.remove('open'); document.getElementById('overlay').classList.remove('open'); }
+// Null-safe: the history panel isn't rendered on the published page, and
+// the overlay's click handler closes every panel without knowing which
+// ones this build actually has.
+function closePanel(id){ const el = document.getElementById(id); if(el){ el.classList.remove('open'); } document.getElementById('overlay').classList.remove('open'); }
 
 document.getElementById('searchBox').oninput = e=>{ state.search = e.target.value; render(); };
 document.getElementById('countrySel').onchange = e=>{ state.country = e.target.value; render(); };
@@ -552,10 +574,24 @@ document.querySelectorAll('[data-preset]').forEach(b=>{
 });
 
 // -- Companies panel --------------------------------------------------
+// With no server behind the published page, roster changes go through the
+// repo that builds it: each control opens a prefilled issue, and a workflow
+// applies it to companies.yaml and rebuilds. Same panel, same list, no
+// local Python and no editing a file by hand.
+const REPO = (META.repo_slug || '').trim();
+const CAN_REQUEST = !LIVE && !!REPO;
+
+function issueUrl(template, fields){
+  const q = new URLSearchParams({template: template});
+  for(const k in fields){ q.set(k, fields[k]); }
+  return 'https://github.com/' + REPO + '/issues/new?' + q.toString();
+}
+
 document.getElementById('companiesBtn').onclick = ()=>{
-  if(!LIVE || !liveOk){ alert('Run "python -m tracker serve" and open the live page to add or remove companies.'); return; }
+  if(!LIVE && !CAN_REQUEST){ alert('This copy of the page has no repository linked, so the roster can only be changed from the tracker it was built from.'); return; }
   document.getElementById('overlay').classList.add('open');
   document.getElementById('companiesPanel').classList.add('open');
+  if(CAN_REQUEST){ document.getElementById('coRepoNote').style.display = 'block'; }
   loadCompanies();
 };
 document.getElementById('companiesClose').onclick = ()=> closePanel('companiesPanel');
@@ -565,6 +601,12 @@ const CO_LIST_CAP = 300;   // roster can run into the thousands; render a capped
 
 function loadCompanies(){
   const list = document.getElementById('companiesList');
+  if(!LIVE){
+    // The roster is already embedded in this page — no server to ask.
+    companiesCache = (META.companies || []).slice();
+    renderCompaniesList();
+    return;
+  }
   list.innerHTML = '<div class="co-list-empty">Loading…</div>';
   fetch('/api/companies').then(r=>r.json()).then(data=>{
     companiesCache = data.companies || [];
@@ -597,6 +639,13 @@ function renderCompaniesList(){
   list.querySelectorAll('[data-act]').forEach(btn=>{
     btn.onclick = ()=>{
       const act = btn.dataset.act, ticker = btn.dataset.ticker;
+      if(!LIVE){
+        window.open(issueUrl('remove-company.yml', {
+          title: '[roster] ' + (act==='remove' ? 'remove ' : 'pause/resume ') + ticker,
+          ticker: ticker, action: act==='remove' ? 'Remove' : 'Pause or resume'
+        }), '_blank');
+        return;
+      }
       const body = act==='toggle' ? {ticker, enabled: btn.dataset.enabled==='true'} : {ticker};
       fetch('/api/companies/'+act, {method:'POST', body: JSON.stringify(body)})
         .then(r=>r.json()).then(()=> loadCompanies());
@@ -618,6 +667,16 @@ document.getElementById('addCoBtn').onclick = ()=>{
     aliases: document.getElementById('newAliases').value.trim(),
   };
   if(!body.ticker || !body.name){ msg.textContent='Ticker and name are required.'; msg.className='msg err'; return; }
+  if(!LIVE){
+    window.open(issueUrl('add-company.yml', {
+      title: '[roster] add ' + body.ticker,
+      ticker: body.ticker, name: body.name, ir: body.ir, exchange: body.exchange,
+      country: body.country, sub_sector: body.sub_sector, cik: body.cik, aliases: body.aliases
+    }), '_blank');
+    msg.textContent = 'Opening a request on GitHub — submit it there and the next hourly build picks it up.';
+    msg.className = 'msg ok';
+    return;
+  }
   fetch('/api/companies/add', {method:'POST', body: JSON.stringify(body)}).then(r=>r.json()).then(res=>{
     msg.textContent = res.message || (res.ok? 'Added.' : 'Could not add company.');
     msg.className = 'msg ' + (res.ok? 'ok':'err');
@@ -627,17 +686,24 @@ document.getElementById('addCoBtn').onclick = ()=>{
 };
 
 // -- History panel ------------------------------------------------------
-document.getElementById('historyBtn').onclick = (ev)=>{
-  ev.preventDefault();
-  if(!LIVE || !liveOk){ alert('History needs the live server running.'); return; }
-  fetch('/api/status').then(r=>r.json()).then(s=>{
-    document.getElementById('historyBody').innerHTML = (s.history||[]).map(h=>
-      `<tr><td>${h.finished_at||''}</td><td>${h.new_count}</td><td>${h.changed_count}</td><td>${h.companies_count}</td><td>${escapeHtml(h.notes||'')}</td></tr>`).join('');
-    document.getElementById('overlay').classList.add('open');
-    document.getElementById('historyPanel').classList.add('open');
-  });
-};
-document.getElementById('historyClose').onclick = ()=> closePanel('historyPanel');
+// Only rendered on the live server; the published page shows its refresh
+// time in the status line instead. Guarded rather than assumed present, so
+// a missing control can't throw here and take the whole script (filters,
+// rendering, everything below) down with it.
+const historyBtn = document.getElementById('historyBtn');
+if(historyBtn){
+  historyBtn.onclick = (ev)=>{
+    ev.preventDefault();
+    if(!LIVE || !liveOk){ alert('History needs the live server running.'); return; }
+    fetch('/api/status').then(r=>r.json()).then(s=>{
+      document.getElementById('historyBody').innerHTML = (s.history||[]).map(h=>
+        `<tr><td>${h.finished_at||''}</td><td>${h.new_count}</td><td>${h.changed_count}</td><td>${h.companies_count}</td><td>${escapeHtml(h.notes||'')}</td></tr>`).join('');
+      document.getElementById('overlay').classList.add('open');
+      document.getElementById('historyPanel').classList.add('open');
+    });
+  };
+  document.getElementById('historyClose').onclick = ()=> closePanel('historyPanel');
+}
 
 // -- Refresh + status polling --------------------------------------------
 function setStatus(text, cls){
@@ -646,10 +712,13 @@ function setStatus(text, cls){
   document.getElementById('statusDot').className = 'dot ' + (cls==='running' ? 'running':'');
 }
 
-document.getElementById('refreshBtn').onclick = ()=>{
-  if(!LIVE || !liveOk){ alert('Run "python -m tracker serve" and open the live page to refresh.'); return; }
-  fetch('/api/refresh', {method:'POST'}).then(r=>r.json()).then(pollLoop);
-};
+const refreshBtn = document.getElementById('refreshBtn');
+if(refreshBtn){
+  refreshBtn.onclick = ()=>{
+    if(!LIVE || !liveOk){ alert('Run "python -m tracker serve" and open the live page to refresh.'); return; }
+    fetch('/api/refresh', {method:'POST'}).then(r=>r.json()).then(pollLoop);
+  };
+}
 
 let lastVersion = null;
 function pollLoop(){
@@ -674,7 +743,11 @@ function pollLoop(){
 function init(){
   buildCatRow();
   render();
-  if(!LIVE){ setStatus('Static export · open the live tracker to refresh', ''); return; }
+  if(!LIVE){
+    var t = (META.last_run_sgt || META.generated_at_sgt || '').trim();
+    setStatus(t ? ('Last refreshed ' + t + ' SGT · updates hourly') : 'Updates hourly', '');
+    return;
+  }
   fetch('/api/ping').then(r=>r.ok ? r.json() : Promise.reject())
     .then(()=>{ liveOk = true; pollLoop(); setInterval(pollLoop, 5000); })
     .catch(()=>{ liveOk = false; setStatus('No live server detected — this looks like a saved copy of the page.', 'error'); });

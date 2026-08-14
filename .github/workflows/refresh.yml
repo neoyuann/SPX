@@ -4,11 +4,12 @@ name: Refresh and publish to GitHub Pages
 # static snapshot to GitHub Pages — a genuinely free, always-available
 # alternative to hosting `tracker serve` somewhere, with none of a paid-
 # tier-required host's sleep-on-idle or ephemeral-disk problems (see
-# render.yaml if you're weighing that against this). The trade-off: no
-# "Refresh now" button and no live company-management panel, since there's
-# no server behind this, only a page rebuilt on a schedule — add companies
-# by editing companies.yaml (or running import_excel_companies.py locally)
-# and pushing, same as any other change.
+# render.yaml if you're weighing that against this). There's no server
+# behind the published page, only a page rebuilt on this schedule, so it
+# carries no "Refresh now" button — this job is the refresh. Roster changes
+# still work from the page: its company panel opens an issue form, which
+# roster-request.yml applies to companies.yaml (or edit that file directly,
+# or run import_excel_companies.py locally, same as any other change).
 #
 # Unlike a naive "fetch and publish" job, this one also commits data/events.db
 # back to the repo after every run (the "Persist accumulated data" step
@@ -20,7 +21,11 @@ name: Refresh and publish to GitHub Pages
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # 07:00 SGT
+    # Every hour, on the hour. Cron here is UTC, but an hourly schedule is
+    # the same wall-clock set of moments in every zone, so this is "every
+    # hour of every day" in Singapore time too — the page's own timestamps
+    # are rendered in SGT (see render.py).
+    - cron: "0 * * * *"
   workflow_dispatch: {}
   push:
     # Whichever branch is actually this repo's default — Settings → General
@@ -35,19 +40,24 @@ permissions:
   id-token: write
 
 concurrency:
+  # Hourly runs must not pile up behind each other: if one overruns, the
+  # next queues, and a backlog would keep the page stale for hours. Each
+  # run is a full refresh rather than an increment (nothing stored is ever
+  # lost by skipping one), so superseding an in-flight run is safe and
+  # keeps the published page tracking the latest data.
   group: pages
-  cancel-in-progress: false
+  cancel-in-progress: true
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    # Belt-and-suspenders: TRACKER_MAX_RUN_SECONDS (25 min) plus
-    # max_link_check_seconds (15 min, config.yaml) should bound the run
+    # Belt-and-suspenders: TRACKER_MAX_RUN_SECONDS (20 min) plus
+    # max_link_check_seconds (10 min, config.yaml) should bound the run
     # itself well under this, but a runaway job used to sit in "in_progress"
     # for GitHub's own 6-hour default hard limit before anyone noticed.
-    # This makes any future unbounded stall — from a cause not yet fixed,
-    # or a new one — visibly fail in under an hour instead.
-    timeout-minutes: 50
+    # Set under the hourly interval so a stuck run can never still be
+    # holding the slot when the next one is due.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -60,12 +70,12 @@ jobs:
       - name: Fetch every source and build the static page
         env:
           SEC_CONTACT_EMAIL: ${{ secrets.SEC_CONTACT_EMAIL }}
-          # A scheduled Actions job doesn't have Render-style 15-minute
-          # sleep-on-idle to worry about, so it can afford a much bigger
-          # fetch budget than the interactive-host default in config.yaml
-          # (600s) — comfortably covering a full pass over a large roster
-          # in one run instead of needing several days of partial ones.
-          TRACKER_MAX_RUN_SECONDS: "1500"
+          # Sized to finish comfortably inside the hour between runs, with
+          # room for the link-check and publish phases after it. A single
+          # run doesn't need to cover the whole roster: fetch order is
+          # shuffled (see pipeline.py), nothing already stored is ever
+          # dropped, and at 24 runs a day coverage accumulates quickly.
+          TRACKER_MAX_RUN_SECONDS: "1200"
         run: python -m tracker run
 
       - name: Persist accumulated data
@@ -77,7 +87,14 @@ jobs:
             git config user.email "github-actions[bot]@users.noreply.github.com"
             git add data/events.db
             git commit -m "Scheduled refresh: update tracked events [skip ci]"
-            git push
+            # A roster request (roster-request.yml) can land on the same
+            # branch while this run was fetching, so don't assume the push
+            # is a fast-forward. Rebase onto whatever arrived and retry.
+            for attempt in 1 2 3; do
+              git push && break
+              echo "Push rejected (attempt $attempt) — rebasing onto the branch and retrying."
+              git pull --rebase origin "$(git rev-parse --abbrev-ref HEAD)" || exit 1
+            done
           fi
 
       - name: Prepare Pages artifact

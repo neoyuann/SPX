@@ -112,7 +112,15 @@ run:
   # silent. This is what turned a job budgeted for well under an hour into
   # one GitHub Actions had to kill at its own 6-hour hard limit, with no
   # error and no clue in the logs about which phase was even stuck.
-  max_link_check_seconds: 900
+  # Sized against the hourly schedule: fetch (max_run_seconds) plus this
+  # must leave room to publish inside the hour. The cache below is what
+  # makes a bound this tight workable — most URLs cost nothing to "check".
+  max_link_check_seconds: 600
+  # How long a link-check result stays good before that URL is re-checked.
+  # An hourly run asking every host about every URL 24 times a day is both
+  # wasteful and rude; a link that answered this morning is not meaningfully
+  # more likely to be dead this afternoon.
+  link_check_ttl_hours: 24
   user_agent: "CorporateEventTracker/1.0 (research use; contact: you@example.com)"
   # ^ SEC EDGAR requires a real contact address in the User-Agent. Put yours in.
 

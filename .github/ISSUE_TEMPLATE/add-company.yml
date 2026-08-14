@@ -1,0 +1,58 @@
+name: Add a company to the tracker
+description: Track a new company's events. Submitted from the dashboard's "Add / remove companies" panel.
+title: "[roster] add "
+labels: ["roster"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Submit this and the roster updates automatically — the change appears
+        on the dashboard after the next hourly refresh. Only the first two
+        fields are required.
+  - type: input
+    id: ticker
+    attributes:
+      label: Ticker
+      description: As it trades, including any market suffix (e.g. 2330.TW, 6758.T, AAPL).
+      placeholder: 2330.TW
+    validations:
+      required: true
+  - type: input
+    id: name
+    attributes:
+      label: Company name
+      placeholder: Taiwan Semiconductor Manufacturing Company
+    validations:
+      required: true
+  - type: input
+    id: ir
+    attributes:
+      label: Investor relations page
+      description: The company's IR or "financial calendar" page, if you know it. This is the single best source of upcoming events.
+      placeholder: https://investor.tsmc.com/english/events
+  - type: input
+    id: exchange
+    attributes:
+      label: Exchange
+      placeholder: TWSE
+  - type: input
+    id: country
+    attributes:
+      label: Country
+      placeholder: Taiwan
+  - type: input
+    id: sub_sector
+    attributes:
+      label: Sub-sector
+      placeholder: Semiconductors
+  - type: input
+    id: cik
+    attributes:
+      label: SEC CIK
+      description: US filers only, and optional — it's resolved from the ticker automatically when left blank.
+  - type: input
+    id: aliases
+    attributes:
+      label: Other names it's reported under
+      description: Comma-separated. Helps news matching find it.
+      placeholder: TSMC, Taiwan Semi
